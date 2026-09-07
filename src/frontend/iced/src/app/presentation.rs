@@ -209,7 +209,14 @@ impl App {
         if frame.presentation_revision > snapshot.presentationrevision {
             return;
         }
-        if self.model.completed_presentation_is_obsolete()
+        let obsolete = match self.model.completed_presentation_is_obsolete() {
+            Ok(obsolete) => obsolete,
+            Err(error) => {
+                self.retire_peer(error);
+                return;
+            }
+        };
+        if obsolete
             || (self.workspace.active() == FeatureId::Explore && !completed)
         {
             self.retire_surface_frame();

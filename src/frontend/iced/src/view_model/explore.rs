@@ -46,11 +46,13 @@ impl ExploreModel {
 
     pub fn presentation_state(&self) -> ExplorePresentationState {
         match self.snapshot.as_ref() {
-            Some(snapshot) if !snapshot.failure.is_empty() => ExplorePresentationState::Error,
-            Some(snapshot) if snapshot.busy => ExplorePresentationState::Loading,
+            Some(snapshot) if snapshot.busy && snapshot.failure.is_empty() => {
+                ExplorePresentationState::Loading
+            }
             Some(snapshot) if snapshot.ready && snapshot.order.matchingcount != 0 => {
                 ExplorePresentationState::Populated
             }
+            Some(snapshot) if !snapshot.failure.is_empty() => ExplorePresentationState::Error,
             Some(_) | None => ExplorePresentationState::Empty,
         }
     }
@@ -77,6 +79,14 @@ impl ExploreModel {
                     }
                     _ => "Explore operation failed",
                 }
+            }
+            ExplorePresentationState::Populated
+                if self
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| !snapshot.failure.is_empty()) =>
+            {
+                "Explore operation failed; showing the last completed product"
             }
             ExplorePresentationState::Populated
                 if self
@@ -121,11 +131,14 @@ impl crate::generated::ExploreApplicationProjection<UiError> for ApplicationMode
                 }
             }
             ApplicationEvent::ExploreExploreFailed(value) => {
+                let retained_product = value.snapshot.ready;
                 match self.install_explore_snapshot(value.snapshot, false) {
                     Err(error) => self.error = Some(error),
                     Ok(Observation::Stale) => {}
                     Ok(Observation::Installed | Observation::Current) => {
-                        self.failed(value.detail);
+                        if !retained_product {
+                            self.failed(value.detail);
+                        }
                     }
                 }
             }
@@ -260,7 +273,7 @@ impl crate::generated::UpscaleApplicationProjection<UiError> for ApplicationMode
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::view_model::test_support::{bootstrapped, explore_snapshot};
+    use crate::view_model::test_support::{bootstrapped, explore_snapshot, visual_frame};
 
     #[test]
     fn gallery_progress_counts_only_the_current_exact_visible_readiness() {
@@ -314,11 +327,18 @@ mod tests {
         assert_eq!(model.presentation_state(), ExplorePresentationState::Empty);
 
         value.order.matchingcount = 1;
+        model.snapshot = Some(value.clone());
+        assert_eq!(
+            model.presentation_state(),
+            ExplorePresentationState::Populated
+        );
+        value.failure = "replacement failed".into();
         model.snapshot = Some(value);
         assert_eq!(
             model.presentation_state(),
             ExplorePresentationState::Populated
         );
+        assert!(model.presentation_title().contains("last completed product"));
     }
 
     #[test]
@@ -339,6 +359,29 @@ mod tests {
             crate::generated::ExploreFailureKind::SelectedTransportUnavailable;
         assert!(model.presentation_title().contains("select H2D"));
         assert_eq!(model.presentation_state(), ExplorePresentationState::Error);
+    }
+
+    #[test]
+    fn recoverable_failure_keeps_the_retained_gallery_visible() {
+        let mut model = bootstrapped();
+        let mut snapshot = model.explore.snapshot.clone().unwrap();
+        snapshot.revision += 1;
+        snapshot.ready = true;
+        snapshot.order.matchingcount = 1;
+        snapshot.failure = "replacement failed".into();
+        snapshot.frame = visual_frame(PresentationSourceKind::Explore, 1);
+        model.reduce_event(ApplicationEvent::ExploreExploreFailed(
+            crate::generated::ExploreFailed {
+                snapshot,
+                detail: "replacement failed".into(),
+            },
+        ));
+
+        assert!(model.error.is_none());
+        assert_eq!(
+            model.explore.presentation_state(),
+            ExplorePresentationState::Populated
+        );
     }
 
     #[test]

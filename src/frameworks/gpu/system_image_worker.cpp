@@ -1,5 +1,6 @@
 #include "src/frameworks/gpu/system_image_worker.h"
 
+#include <limits>
 #include <stdexcept>
 #include <utility>
 #include "src/common/system/execution_policy.h"
@@ -41,14 +42,14 @@ struct SystemImageRuntime::State final {
             policy.emplace(mmltk::common::system::ExecutionPolicyRequest{
                 execution->placement.cpus, {}, 0, execution->placement.numa_node, -10, false});
         input = std::make_unique<ImageProductBuffer>(*context, config.input_layout);
-        output = std::make_unique<ImageProductBuffer>(*context, config.output_layout);
+        output = std::make_unique<ImageProductPool>(*context, config.output_layout, config.output_buffer_count);
         stream = std::make_unique<ImageStream>(*context);
     }
 
     std::optional<DeviceContext> context;
     std::unique_ptr<SystemImageModel> model;
     std::unique_ptr<ImageProductBuffer> input;
-    std::unique_ptr<ImageProductBuffer> output;
+    std::unique_ptr<ImageProductPool> output;
     std::unique_ptr<ImageStream> stream;
     bool retired = false;
 };
@@ -175,14 +176,33 @@ const SystemImageRuntime::State& SystemImageRuntime::ActiveState() const {
     if (!state_ || state_->retired) throw std::runtime_error("system image runtime is retired");
     return *state_;
 }
-ImageProductBuffer& SystemImageRuntime::output() { return *ActiveState().output; }
-const ImageProductBuffer& SystemImageRuntime::output() const { return *ActiveState().output; }
+ImageProductBuffer& SystemImageRuntime::output() { return ActiveState().output->selected(); }
+const ImageProductBuffer& SystemImageRuntime::output() const { return ActiveState().output->selected(); }
+SystemImageRuntime::OutputCandidate SystemImageRuntime::AcquireOutput(const std::stop_token stop) {
+    return ActiveState().output->Acquire(stop);
+}
+void SystemImageRuntime::Publish(OutputCandidate& candidate, const std::uint32_t width, const std::uint32_t height,
+                                 const ImageCandidateInitialization initialization, ImageProductBuffer::ProductSubmit submit) {
+    auto& state = ActiveState();
+    state.output->Publish(*state.stream, candidate, width, height, TakeProductRevision(), initialization, std::move(submit));
+}
+SystemImageRuntime::CompletedOutput SystemImageRuntime::CommitOutput(OutputCandidate&& candidate) {
+    return ActiveState().output->Commit(std::move(candidate));
+}
+void SystemImageRuntime::SelectOutput(const CompletedOutput& product) { ActiveState().output->Select(product); }
+void SystemImageRuntime::SetOutputAvailableSink(std::function<void()> sink) {
+    ActiveState().output->SetAvailabilitySink(std::move(sink));
+}
+void SystemImageRuntime::SetProductRevisionSequence(std::shared_ptr<std::atomic<std::uint64_t>> sequence) {
+    if (!sequence) throw std::invalid_argument("image product revision sequence is unavailable");
+    product_revision_sequence_ = std::move(sequence);
+}
 BorrowedImageProductReadView SystemImageRuntime::BorrowInput() const { return ActiveState().input->Borrow(); }
 BorrowedImageProductReadView SystemImageRuntime::Borrow() const { return ActiveState().output->Borrow(); }
 SystemImageModel* SystemImageRuntime::model() noexcept { return state_ && !state_->retired ? state_->model.get() : nullptr; }
 std::array<ImageCopyPath, 2U> SystemImageRuntime::CopyFrom(BorrowedImageProductReadView source) {
     auto& state = ActiveState();
-    return state.output->CopyFrom(*state.stream, std::move(source));
+    return state.output->CopyFrom(*state.stream, std::move(source), TakeProductRevision());
 }
 std::array<ImageCopyPath, 2U> SystemImageRuntime::CopyInputFrom(BorrowedImageProductReadView source,
                                                                 ImageProductBuffer::MissingPlaneSubmit initialize_missing) {
@@ -191,7 +211,22 @@ std::array<ImageCopyPath, 2U> SystemImageRuntime::CopyInputFrom(BorrowedImagePro
 }
 void SystemImageRuntime::Publish(const std::uint32_t width, const std::uint32_t height, ImageProductBuffer::ProductSubmit submit) {
     auto& state = ActiveState();
-    state.output->Publish(*state.stream, width, height, std::move(submit));
+    auto candidate = state.output->Acquire();
+    if (!candidate.valid()) throw std::runtime_error("image output candidate is unavailable");
+    state.output->Publish(*state.stream, candidate, width, height, TakeProductRevision(), ImageCandidateInitialization::Empty,
+                          std::move(submit));
+    static_cast<void>(state.output->Commit(std::move(candidate)));
+}
+std::uint64_t SystemImageRuntime::TakeProductRevision() {
+    if (!product_revision_sequence_) product_revision_sequence_ = std::make_shared<std::atomic<std::uint64_t>>(1U);
+    auto current = product_revision_sequence_->load(std::memory_order_acquire);
+    for (;;) {
+        if (current == 0U || current == std::numeric_limits<std::uint64_t>::max())
+            throw std::overflow_error("image product revision sequence exhausted");
+        if (product_revision_sequence_->compare_exchange_weak(current, current + 1U, std::memory_order_acq_rel,
+                                                               std::memory_order_acquire))
+            return current;
+    }
 }
 SystemImageWorker::SystemImageWorker(Cycle cycle, FailureSink failures, Cleanup cleanup)
     : cycle_(std::move(cycle)),

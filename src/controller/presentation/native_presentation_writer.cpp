@@ -29,7 +29,7 @@ namespace raster = mmltk::backend::imaging::raster;
 
 struct NativeAllocation final {
     struct LatestFrame final {
-        VisualFrame frame{};
+        VisualSourceObservation source{};
         std::uint64_t presentation_revision = 0U;
     };
 
@@ -65,12 +65,14 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         if (!SettleSourceRead()) std::terminate();
     }
 
-    void Submit(const VisualFrame frame, const std::uint64_t selection_generation, const VisualSourceReader& source) override {
+    void Submit(const VisualSourceObservation observation, const std::uint64_t selection_generation,
+                const VisualSourceReader& source) override {
         context_.Bind();
-        if (!frame.valid() || selection_generation == 0U || source.source != frame.source || !source.borrow || pending_frame_)
+        if (!observation.valid() || selection_generation == 0U || source.source != observation.frame.source || !source.borrow ||
+            pending_frame_)
             throw std::invalid_argument("presentation native submission is invalid");
         pending_frame_ = PendingFrame{
-            .frame = frame,
+            .source = observation,
             .selection_generation = selection_generation,
             .reader = std::addressof(source),
         };
@@ -119,7 +121,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
 
    private:
     struct PendingFrame final {
-        VisualFrame frame{};
+        VisualSourceObservation source{};
         std::uint64_t selection_generation = 0U;
         const VisualSourceReader* reader = nullptr;
     };
@@ -199,19 +201,19 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                                       .surface_high = id.high,
                                       .surface_low = id.low,
                                       .selection_generation = pending_frame_ ? pending_frame_->selection_generation : 0U,
-                                      .frame_revision = pending_frame_ ? pending_frame_->frame.revision : 0U,
+                                      .frame_revision = pending_frame_ ? pending_frame_->source.frame.revision : 0U,
                                       .condition = static_cast<std::uint64_t>(PresentationCapabilityCondition::Unavailable),
                                       .outcome = 1U}});
         if (!channel_.admit(id, generation, width, height, pitch, allocation->allocation_size(), std::move(descriptor), frame_edge.get(),
                             frame_signal.descriptor(), pending_frame_ ? pending_frame_->selection_generation : 0U,
-                            pending_frame_ ? pending_frame_->frame.revision : 0U))
+                            pending_frame_ ? pending_frame_->source.frame.revision : 0U))
             throw std::runtime_error("Firefox surface import admission failed");
         candidate_ = std::make_unique<NativeAllocation>(NativeAllocation{
             .buffer = std::move(allocation),
             .import_id = id,
             .generation = generation,
             .selection_generation = pending_frame_ ? pending_frame_->selection_generation : 0U,
-            .frame_revision = pending_frame_ ? pending_frame_->frame.revision : 0U,
+            .frame_revision = pending_frame_ ? pending_frame_->source.frame.revision : 0U,
             .width = width,
             .height = height,
             .pitch = pitch,
@@ -273,7 +275,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     void EnsureTargetForPending() {
         if (!pending_frame_) return;
         if (!channel_.connected()) return;
-        const auto extent = pending_frame_->frame.extent;
+        const auto extent = pending_frame_->source.frame.extent;
         if (Contains(active_.get(), extent) || Contains(candidate_.get(), extent)) return;
         if (candidate_) WithdrawStaleCandidate();
         if (!candidate_) {
@@ -283,7 +285,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             // The undersized candidate must finish its real page claim before
             // the ordinary stale-candidate path can retire it.
             if (pending_supersession_acceptance_ && active_ && !retiring_ &&
-                pending_frame_->frame.source.kind == PresentationSourceKind::Upscale) {
+                pending_frame_->source.frame.source.kind == PresentationSourceKind::Upscale) {
                 pending_supersession_acceptance_ = false;
                 BeginImport({active_->width, active_->height});
             } else {
@@ -337,7 +339,8 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                 .selection_generation = superseded,
             };
         }
-        const auto frame = pending_frame_->frame;
+        const auto observation = pending_frame_->source;
+        const auto& frame = observation.frame;
         NativeAllocation* target = nullptr;
         if (!retiring_ && candidate_ && candidate_->timeline && Contains(candidate_.get(), frame.extent))
             target = candidate_.get();
@@ -395,7 +398,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             if (status != cudaSuccess) throw std::runtime_error("presentation exported backbuffer copy failed");
             presentation_revision = native::detail::take_monotonic_identity(next_presentation_revision_);
             target->latest = NativeAllocation::LatestFrame{
-                .frame = frame,
+                .source = observation,
                 .presentation_revision = presentation_revision,
             };
             ready = OfferLatest(*target, stream);
@@ -435,6 +438,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                     .timeline_ready = ready,
                     .presentation_revision = presentation_revision,
                 },
+            .source_observation = observation,
         };
         pending_frame_.reset();
         return outcome;
@@ -449,7 +453,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         if (cudaStreamSynchronize(stream) != cudaSuccess) throw std::runtime_error("presentation ready publication failed");
         DiagnoseAllocation(VisualDiagnosticOperation::PresentationReadySyncCompleted, allocation, 1U);
         const auto& latest = *allocation.latest;
-        const auto& frame = latest.frame;
+        const auto& frame = latest.source.frame;
         native::detail::publish_workspace_frame_signal(allocation.frame_signal.mapping(), ready, transfer_sequence,
                                                        native::WorkspacePresentationLayer::Primary,
                                                        {

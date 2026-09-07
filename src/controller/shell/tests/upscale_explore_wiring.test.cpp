@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <future>
 #include <memory>
+#include <string>
 #include <stdexcept>
 #include <utility>
 #include <variant>
@@ -155,6 +156,26 @@ TEST_CASE("shell keeps Explore ready when warm publishes an isolated Upscale fai
     CHECK(other_upscale_events.load(std::memory_order_acquire) == 0U);
     route.Route();
     CHECK(probe->calls.load(std::memory_order_acquire) == 1U);
+}
+
+TEST_CASE("shell routes essential event encoding failure through continuity recovery") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto probe = std::make_shared<ShellWarmProbe>();
+    auto upscale = shell_upscale(backend, probe);
+    std::vector<browser::SystemEvent> forwarded;
+    ApplicationSystemStorage::EventSink events{
+        [&forwarded](browser::SystemEvent event) { forwarded.push_back(std::move(event)); }};
+    std::atomic_uint64_t continuity_losses{0U};
+    auto route = make_explore_upscale_event_sink(events, upscale, [&continuity_losses] {
+        continuity_losses.fetch_add(1U, std::memory_order_acq_rel);
+    });
+    route(ExploreFailed{
+        .snapshot = {.revision = 8U},
+        .detail = std::string(kVisualFailureByteCapacity + 1U, 'x'),
+    });
+
+    CHECK(forwarded.empty());
+    CHECK(continuity_losses.load(std::memory_order_acquire) == 1U);
 }
 
 }  // namespace

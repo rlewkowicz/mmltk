@@ -610,6 +610,15 @@ TEST_CASE("direct host closes critical pressure in the real open epoch") {
     REQUIRE(server.context()->await(transport::BrowserServerEvent::CriticalCapacityClosed));
 }
 
+TEST_CASE("direct host closes the peer when essential state continuity is lost") {
+    RunningHost server{OpenPressure::None};
+    LoopbackWebSocket peer{server.websocket(), HandshakePolicy::AllowPeerClose};
+    REQUIRE(peer.receive());
+    server.context()->owner->continuity_lost();
+    const auto terminal = peer.receive();
+    CHECK((!terminal || terminal->opcode == 8U));
+}
+
 TEST_CASE("direct host preserves the final complete state across a snapshot burst") {
     RunningHost server{OpenPressure::LatestState};
     LoopbackWebSocket peer{server.websocket()};

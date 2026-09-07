@@ -201,6 +201,8 @@ class ExploreAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
     [[nodiscard]] virtual std::optional<std::uint32_t> Adjacent(std::uint32_t, std::int64_t offset) const = 0;
     virtual void SetGalleryReadySink(GalleryReadySink) = 0;
     virtual void PrepareOutputPublication() = 0;
+    virtual void CommitOutputPublication() noexcept = 0;
+    [[nodiscard]] virtual bool RollbackOutputPublication() noexcept = 0;
     [[nodiscard]] virtual ExploreGalleryPublication BeginGallery(const ExploreRenderPlan&, const ExploreOrderCandidate*, std::size_t,
                                                                  mmltk::frameworks::gpu::ImagePlaneView,
                                                                  mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) = 0;

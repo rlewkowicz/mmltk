@@ -1,63 +1,52 @@
 use super::*;
 
 impl ApplicationModel {
-    pub(crate) fn completed_presentation_is_obsolete(&self) -> bool {
+    pub(crate) fn completed_presentation_is_obsolete(&self) -> Result<bool, UiError> {
         let Some(presentation) = self.presentation.as_ref() else {
-            return false;
+            return Ok(false);
         };
         let completed = &presentation.completed;
         let Some(kind) = self.foreground_visual else {
-            return true;
+            return Ok(true);
         };
         if kind == PresentationSourceKind::Explore
             && completed.source.kind == PresentationSourceKind::Upscale
         {
             // The native mailbox may beat the matching Upscale snapshot. Keep
             // that publication while its explicit viewer demand still exists.
-            return self.explore.requested_upscale.is_none()
+            return Ok(self.explore.requested_upscale.is_none()
                 || self.upscale_snapshot.as_ref().is_some_and(|snapshot| {
                     snapshot.frame.source == completed.source
                         && snapshot.frame.revision >= completed.revision
                         && self.current_upscale().is_none()
-                });
+                }));
         }
         if completed.source.kind != kind {
-            return true;
+            return Ok(true);
         }
-        if matches!(
-            kind,
-            PresentationSourceKind::Explore | PresentationSourceKind::Upscale
-        ) {
-            let current = if kind == PresentationSourceKind::Explore {
-                self.explore
-                    .snapshot
-                    .as_ref()
-                    .map(|snapshot| &snapshot.frame)
-            } else {
-                self.upscale_snapshot
-                    .as_ref()
-                    .map(|snapshot| &snapshot.frame)
-            };
-            let Some(current) = current else {
-                return false;
-            };
-            if completed.source != current.source {
-                return true;
-            }
-            if completed.revision > current.revision {
-                return false;
-            }
-            return completed != current
-                || (kind == PresentationSourceKind::Upscale && self.current_upscale().is_none())
+        let Some((current, current_observation)) = self.frame_observation_for(kind) else {
+            return Ok(false);
+        };
+        if completed == current {
+            return Ok((kind == PresentationSourceKind::Upscale && self.current_upscale().is_none())
                 || (kind == PresentationSourceKind::Explore
                     && self.explore.requested_selection.is_some_and(|image| {
                         self.explore
                             .snapshot
                             .as_ref()
                             .is_none_or(|snapshot| snapshot.selectedimage != Some(image))
-                    }));
+                    })));
         }
-        false
+        if completed.source != current.source {
+            return Ok(true);
+        }
+        match current_observation.cmp(&presentation.completedsourcerevision) {
+            std::cmp::Ordering::Less => Ok(false),
+            std::cmp::Ordering::Greater => Ok(true),
+            std::cmp::Ordering::Equal => Err(UiError::protocol(
+                "one source observation described different completed frames",
+            )),
+        }
     }
 
     pub(crate) fn selected_detail_source(&self) -> Option<crate::generated::AnnotationOpen> {
@@ -188,6 +177,37 @@ impl ApplicationModel {
         .filter(|frame| Self::valid_visual_source(frame).is_some())
     }
 
+    fn frame_observation_for(
+        &self,
+        kind: PresentationSourceKind,
+    ) -> Option<(&VisualFrame, u64)> {
+        match kind {
+            PresentationSourceKind::Explore => self
+                .explore
+                .snapshot
+                .as_ref()
+                .map(|snapshot| (&snapshot.frame, snapshot.revision)),
+            PresentationSourceKind::Annotation => self
+                .annotation
+                .snapshot
+                .as_ref()
+                .map(|snapshot| (&snapshot.frame, snapshot.revision)),
+            PresentationSourceKind::Live => self
+                .live_snapshot
+                .as_ref()
+                .map(|snapshot| (&snapshot.frame, snapshot.revision)),
+            PresentationSourceKind::Upscale => self
+                .upscale_snapshot
+                .as_ref()
+                .map(|snapshot| (&snapshot.frame, snapshot.revision)),
+            PresentationSourceKind::Predict => self
+                .predict_snapshot
+                .as_ref()
+                .map(|snapshot| (&snapshot.frame, snapshot.revision)),
+            PresentationSourceKind::None => None,
+        }
+    }
+
     pub fn source_for(&self, kind: PresentationSourceKind) -> Option<PresentationSourceIdentity> {
         self.frame_for(kind).map(|frame| frame.source.clone())
     }
@@ -242,8 +262,23 @@ impl ApplicationModel {
             .presentation
             .as_ref()
             .map(|snapshot| &snapshot.completed);
+        if let (Some(presentation), Some((_, observation))) = (
+            self.presentation.as_ref(),
+            self.frame_observation_for(foreground),
+        ) && presentation.completed.source == frame.source
+            && presentation.completed != frame
+            && presentation.completedsourcerevision >= observation
+        {
+            return None;
+        }
         (completed != Some(&frame) && self.sent_presentation_frame.as_ref() != Some(&frame))
             .then_some(frame)
+    }
+
+    pub fn presentation_recovery_refresh(&self) -> Option<VisualFrame> {
+        self.foreground_visual
+            .and_then(|kind| self.frame_for(kind))
+            .cloned()
     }
 
     pub fn record_presentation_sent(&mut self, frame: VisualFrame) {
@@ -511,6 +546,62 @@ mod tests {
             model.presentation_refresh(),
             Some(visual_frame(PresentationSourceKind::Explore, 4))
         );
+    }
+
+    #[test]
+    fn source_observation_orders_metadata_and_cached_product_arrivals() {
+        let mut model = bootstrapped();
+        model.set_foreground_feature(FeatureId::Explore);
+        let first = visual_frame(PresentationSourceKind::Explore, 1);
+        let second = visual_frame(PresentationSourceKind::Explore, 2);
+        {
+            let explore = model.explore.snapshot.as_mut().unwrap();
+            explore.ready = true;
+            explore.revision = 10;
+            explore.frame = first.clone();
+        }
+        {
+            let presentation = model.presentation.as_mut().unwrap();
+            presentation.completed = second.clone();
+            presentation.completedsourcerevision = 20;
+        }
+        assert!(!model.completed_presentation_is_obsolete().unwrap());
+
+        {
+            let explore = model.explore.snapshot.as_mut().unwrap();
+            explore.revision = 30;
+            explore.frame = first.clone();
+        }
+        assert!(model.completed_presentation_is_obsolete().unwrap());
+
+        {
+            let explore = model.explore.snapshot.as_mut().unwrap();
+            explore.revision = 20;
+            explore.frame = first;
+        }
+        assert!(model.completed_presentation_is_obsolete().is_err());
+
+        model.explore.snapshot.as_mut().unwrap().frame = second.clone();
+        assert!(!model.completed_presentation_is_obsolete().unwrap());
+        model.explore.snapshot.as_mut().unwrap().revision += 1;
+        assert!(!model.completed_presentation_is_obsolete().unwrap());
+    }
+
+    #[test]
+    fn reconnect requests_the_foreground_product_even_when_native_completion_matches() {
+        let mut model = bootstrapped();
+        model.set_foreground_feature(FeatureId::Explore);
+        let frame = visual_frame(PresentationSourceKind::Explore, 4);
+        {
+            let explore = model.explore.snapshot.as_mut().unwrap();
+            explore.ready = true;
+            explore.revision = 7;
+            explore.frame = frame.clone();
+        }
+        model.presentation.as_mut().unwrap().completed = frame.clone();
+
+        assert!(model.presentation_refresh().is_none());
+        assert_eq!(model.presentation_recovery_refresh(), Some(frame));
     }
 
     #[test]

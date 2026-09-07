@@ -32,7 +32,7 @@ class PresentationSystem::Impl final {
         if (!settings_.valid() || sources.empty() || sources.size() > kMaximumSources)
             throw contracts::InvalidIntentError("Presentation configuration is invalid");
         for (const auto& source : sources) {
-            if (!source.source.valid() || !source.latest || !source.borrow ||
+            if (!source.source.valid() || !source.observe || !source.borrow ||
                 std::ranges::count(sources, source.source, &VisualSourceReader::source) != 1)
                 throw contracts::InvalidIntentError("Presentation source registry is invalid");
         }
@@ -153,7 +153,7 @@ class PresentationSystem::Impl final {
         std::uint64_t generation = 0U;
     };
     struct InFlight final {
-        VisualFrame frame{};
+        VisualSourceObservation source{};
         std::uint64_t selection_generation = 0U;
     };
 
@@ -187,10 +187,7 @@ class PresentationSystem::Impl final {
                 if (found != sources_.end()) {
                     reader = std::addressof(*found);
                     in_flight_ = InFlight{
-                        .frame =
-                            {
-                                .source = pending->source,
-                            },
+                        .source = {.frame = {.source = pending->source}},
                         .selection_generation = pending->generation,
                     };
                 }
@@ -198,24 +195,27 @@ class PresentationSystem::Impl final {
         }
         if (expected_process_group) writer_->SetExpectedBrowserProcessGroup(*expected_process_group);
         if (reader) {
-            const VisualFrame frame = reader->latest();
-            if (frame.valid() && (frame.extent.width > settings_.maximum_width || frame.extent.height > settings_.maximum_height))
+            const VisualSourceObservation observation = reader->observe();
+            const auto& frame = observation.frame;
+            if (observation.valid() &&
+                (frame.extent.width > settings_.maximum_width || frame.extent.height > settings_.maximum_height))
                 throw contracts::InvalidIntentError("presentation source exceeds backbuffer bounds");
             bool submit = false;
             {
                 std::scoped_lock lock(mutex_);
                 const bool reserved =
-                    in_flight_ && in_flight_->selection_generation == pending->generation && in_flight_->frame.source == pending->source;
-                if (reserved && !stopping_ && !stop.stop_requested() && frame.valid() && frame.source == pending->source &&
+                    in_flight_ && in_flight_->selection_generation == pending->generation &&
+                    in_flight_->source.frame.source == pending->source;
+                if (reserved && !stopping_ && !stop.stop_requested() && observation.valid() && frame.source == pending->source &&
                     pending->generation == selection_generation_ && state_.selected == pending->source) {
-                    in_flight_->frame = frame;
+                    in_flight_->source = observation;
                     submit = true;
                 } else if (reserved) {
                     in_flight_.reset();
                     wake_again = pending_.has_value();
                 }
             }
-            if (submit) writer_->Submit(frame, pending->generation, *reader);
+            if (submit) writer_->Submit(observation, pending->generation, *reader);
         }
         std::uint64_t pump_generation = 0U;
         std::uint64_t pump_frame_revision = 0U;
@@ -223,7 +223,7 @@ class PresentationSystem::Impl final {
             std::scoped_lock lock(mutex_);
             if (stopping_ || stop.stop_requested()) return;
             pump_generation = selection_generation_;
-            if (in_flight_) pump_frame_revision = in_flight_->frame.revision;
+            if (in_flight_) pump_frame_revision = in_flight_->source.frame.revision;
         }
         if (pump_frame_revision != 0U)
             diagnostics_({
@@ -263,7 +263,8 @@ class PresentationSystem::Impl final {
                     break;
                 case PresentationNativeProgress::Superseded:
                     if (in_flight_ && in_flight_->selection_generation == outcome.selection_generation) {
-                        if (in_flight_->selection_generation == selection_generation_ && state_.selected == in_flight_->frame.source)
+                        if (in_flight_->selection_generation == selection_generation_ &&
+                            state_.selected == in_flight_->source.frame.source)
                             pending_ = Pending{
                                 .source = state_.selected,
                                 .generation = selection_generation_,
@@ -280,12 +281,16 @@ class PresentationSystem::Impl final {
             } else {
                 if (!in_flight_ || outcome.selection_generation != in_flight_->selection_generation || !outcome.publication.valid())
                     throw std::runtime_error("Presentation native publication failed");
-                const auto frame = in_flight_->frame;
+                const auto observation = in_flight_->source;
+                const auto& frame = observation.frame;
+                if (outcome.source_observation != observation)
+                    throw std::runtime_error("Presentation native publication changed its source observation");
                 const bool current = in_flight_->selection_generation == selection_generation_ && state_.selected == frame.source;
                 in_flight_.reset();
                 if (current) {
                     completed = state_;
                     completed.completed = frame;
+                    completed.completed_source_revision = observation.snapshot_revision;
                     completed.timeline_ready = outcome.publication.timeline_ready;
                     completed.presentation_revision = outcome.publication.presentation_revision;
                     completed.revision = presentation::detail::advance_monotonic_identity(completed.revision);

@@ -18,7 +18,7 @@ namespace mmltk::controller {
 
 struct VisualSourceReader final {
     PresentationSourceIdentity source{};
-    std::function<VisualFrame()> latest;
+    std::function<VisualSourceObservation()> observe;
     std::function<mmltk::frameworks::gpu::BorrowedImageProductReadView()> borrow;
 };
 struct RendererObservation final {
@@ -48,6 +48,7 @@ struct PresentationSnapshot final {
     std::uint64_t revision = 0U;
     PresentationSourceIdentity selected{};
     VisualFrame completed{};
+    std::uint64_t completed_source_revision = 0U;
     std::uint64_t timeline_ready = 0U;
     std::uint64_t presentation_revision = 0U;
     PresentationCapability capability{};
@@ -84,6 +85,7 @@ struct PresentationNativeOutcome final {
     std::uint64_t selection_generation = 0U;
     PresentationPublication publication{};
     PresentationCapability capability{};
+    VisualSourceObservation source_observation{};
 };
 enum class PresentationShutdownResult : std::uint8_t {
     Stopped,
@@ -96,7 +98,7 @@ class PresentationNativeWriter {
         bool safe_to_destroy = true;
     };
     virtual ~PresentationNativeWriter() = default;
-    virtual void Submit(VisualFrame, std::uint64_t selection_generation, const VisualSourceReader&) = 0;
+    virtual void Submit(VisualSourceObservation, std::uint64_t selection_generation, const VisualSourceReader&) = 0;
     [[nodiscard]] virtual PresentationNativeOutcome Pump(std::uint64_t current_selection_generation) = 0;
     [[nodiscard]] virtual int poll_fd() const noexcept = 0;
     [[nodiscard]] virtual bool wants_write() const noexcept = 0;
@@ -112,8 +114,8 @@ struct PresentationNativeConfiguration final {
 };
 [[nodiscard]] PresentationNativeWriterFactory make_native_presentation_writer_factory(VisualDeviceSettings, PresentationNativeConfiguration,
                                                                                       VisualDiagnosticSink = {});
-struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Transient}]] PresentationCompleted final {
-    // CLEANUP-IGNORE: Presentation completion has its own reflected identity and transient delivery contract.
+struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::LatestState}]] PresentationCompleted final {
+    // CLEANUP-IGNORE: Presentation completion has its own reflected identity and durable state-delivery contract.
     PresentationSnapshot snapshot{};
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] PresentationCapabilityChanged final {

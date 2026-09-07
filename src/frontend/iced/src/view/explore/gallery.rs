@@ -318,7 +318,6 @@ fn gallery_viewport<'a>(
         .is_some_and(|value| {
             value.ready
                 && value.order.matchingcount != 0
-                && value.failure.is_empty()
                 && value.mode == crate::generated::ExploreMode::Gallery
         })
         .then_some(surface)

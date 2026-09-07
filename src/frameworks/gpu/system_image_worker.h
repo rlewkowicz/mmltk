@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <array>
 #include <condition_variable>
 #include <cstddef>
@@ -34,6 +35,7 @@ struct SystemImageRuntimeConfig final {
     DeviceContextMode context_mode = DeviceContextMode::Isolated;
     ImageProductLayout input_layout = ImageProductLayout::Clean;
     ImageProductLayout output_layout = ImageProductLayout::Clean;
+    std::size_t output_buffer_count = 1U;
     int numa_node = -1;
     std::optional<DeviceExecution> execution{};
 };
@@ -78,6 +80,14 @@ class SystemImageRuntime final {
     [[nodiscard]] static std::optional<UnsafeCustody> UnsafeConstruction(std::exception_ptr) noexcept;
     [[nodiscard]] ImageProductBuffer& output();
     [[nodiscard]] const ImageProductBuffer& output() const;
+    using OutputCandidate = ImageProductPool::Candidate;
+    using CompletedOutput = ImageProductPool::Product;
+    [[nodiscard]] OutputCandidate AcquireOutput(std::stop_token = {});
+    void Publish(OutputCandidate&, std::uint32_t, std::uint32_t, ImageCandidateInitialization, ImageProductBuffer::ProductSubmit);
+    CompletedOutput CommitOutput(OutputCandidate&&);
+    void SelectOutput(const CompletedOutput&);
+    void SetOutputAvailableSink(std::function<void()>);
+    void SetProductRevisionSequence(std::shared_ptr<std::atomic<std::uint64_t>>);
     [[nodiscard]] BorrowedImageProductReadView BorrowInput() const;
     [[nodiscard]] BorrowedImageProductReadView Borrow() const;
     [[nodiscard]] SystemImageModel* model() noexcept;
@@ -91,8 +101,10 @@ class SystemImageRuntime final {
     [[nodiscard]] UnsafeCustody Retain(std::exception_ptr) noexcept;
     [[nodiscard]] State& ActiveState();
     [[nodiscard]] const State& ActiveState() const;
+    [[nodiscard]] std::uint64_t TakeProductRevision();
     std::shared_ptr<State> state_;
     std::shared_ptr<RetentionControl> retention_;
+    std::shared_ptr<std::atomic<std::uint64_t>> product_revision_sequence_;
 };
 
 class SystemImageWorker final {

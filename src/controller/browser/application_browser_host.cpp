@@ -251,6 +251,13 @@ struct ApplicationBrowserHost::Impl final {
         const auto record_priority = priority(event.delivery);
         if (!publish_record(event, record_priority) && record_priority == transport::BrowserRecordPriority::Critical) server->close_peer();
     }
+    void continuity_lost() noexcept {
+        diagnostics.write({
+            .owner = services::RuntimeDiagnosticOwner::BrowserRuntime,
+            .event = "browser.state_continuity_lost",
+        });
+        if (server) server->close_peer();
+    }
 
     static void Opened(void* context) noexcept { static_cast<Impl*>(context)->opened(); }
     static bool Record(void* context, const std::span<const std::byte> bytes) noexcept {
@@ -293,6 +300,7 @@ transport::BrowserServer::Callbacks ApplicationBrowserHost::callbacks() const no
 }
 
 void ApplicationBrowserHost::publish(SystemEvent event) noexcept { impl_->publish(std::move(event)); }
+void ApplicationBrowserHost::continuity_lost() noexcept { impl_->continuity_lost(); }
 
 void ApplicationBrowserHost::close_admission() noexcept { impl_->admission.store(false, std::memory_order_release); }
 

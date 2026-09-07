@@ -228,6 +228,8 @@ class SynchronousExploreAlgorithm : public ExploreAlgorithm {
     void DiscardCandidate() override {}
     void SetGalleryReadySink(GalleryReadySink) final {}
     void PrepareOutputPublication() final {}
+    void CommitOutputPublication() noexcept final {}
+    bool RollbackOutputPublication() noexcept final { return true; }
     ExploreGalleryPublication BeginGallery(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc,
                                            const mmltk::frameworks::gpu::ImagePlaneView clean,
                                            const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream) final {
@@ -404,7 +406,7 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
     }
     void Commit(ExploreOrderCandidate) noexcept override {}
     void AbortRenderGeneration() override { ClearStreamingState(); }
-    void DiscardCandidate() override { AbortRenderGeneration(); }
+    void DiscardCandidate() override {}
     void Reset() noexcept override {
         ClearStreamingState();
         order_.clear();
@@ -427,7 +429,43 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
         std::scoped_lock lock(probe_->mutex);
         probe_->ready_sink = std::move(sink);
     }
-    void PrepareOutputPublication() override {}
+    void PrepareOutputPublication() override {
+        std::scoped_lock lock(probe_->mutex);
+        if (checkpoint_) return;
+        checkpoint_.emplace(PublicationCheckpoint{
+            .assignments = probe_->assignments,
+            .visible = probe_->visible,
+            .completed_slots = probe_->completed_slots,
+            .priority_slots = probe_->priority_slots,
+            .generation = probe_->generation,
+            .nproc = probe_->nproc,
+            .next_slot = probe_->next_slot,
+            .cumulative = probe_->cumulative,
+        });
+    }
+    void CommitOutputPublication() noexcept override { checkpoint_.reset(); }
+    bool RollbackOutputPublication() noexcept override {
+        GalleryReadySink wake;
+        {
+            std::scoped_lock lock(probe_->mutex);
+            if (!checkpoint_) return true;
+            ++probe_->quiescences;
+            probe_->aborted_assignments += probe_->assignments.size();
+            probe_->assignments = std::move(checkpoint_->assignments);
+            probe_->visible = std::move(checkpoint_->visible);
+            probe_->completed_slots = std::move(checkpoint_->completed_slots);
+            probe_->priority_slots = std::move(checkpoint_->priority_slots);
+            probe_->generation = checkpoint_->generation;
+            probe_->nproc = checkpoint_->nproc;
+            probe_->next_slot = checkpoint_->next_slot;
+            probe_->cumulative = checkpoint_->cumulative;
+            checkpoint_.reset();
+            wake = probe_->ready_sink;
+            probe_->changed.notify_all();
+        }
+        if (wake) wake();
+        return true;
+    }
     ExploreGalleryPublication BeginGallery(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc,
                                            const mmltk::frameworks::gpu::ImagePlaneView clean,
                                            const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) override {
@@ -526,6 +564,17 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
     }
 
    private:
+    struct PublicationCheckpoint final {
+        std::vector<StreamingExploreProbe::Assignment> assignments;
+        std::vector<std::uint32_t> visible;
+        std::vector<bool> completed_slots;
+        std::vector<std::uint32_t> priority_slots;
+        std::uint64_t generation = 0U;
+        std::size_t nproc = 1U;
+        std::size_t next_slot = 0U;
+        std::size_t cumulative = 0U;
+    };
+
     void PrioritizeLocked(const ExploreRenderPlan& plan) {
         probe_->priority_slots.clear();
         if (plan.focused_image) {
@@ -588,12 +637,13 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
     std::shared_ptr<StreamingExploreProbe> probe_;
     std::vector<std::uint32_t> order_;
     std::uint64_t candidate_generation_ = 0U;
+    std::optional<PublicationCheckpoint> checkpoint_;
 };
 
 [[nodiscard]] VisualRuntimeFactory streaming_explore_runtime_factory(std::shared_ptr<FakeImageBackend> backend,
                                                                      std::shared_ptr<StreamingExploreProbe> probe) {
     return RuntimeFactory(0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                          [probe = std::move(probe)] { return std::make_unique<ControlledStreamingExploreAlgorithm>(probe); });
+                          [probe = std::move(probe)] { return std::make_unique<ControlledStreamingExploreAlgorithm>(probe); }, 2U);
 }
 
 class TestExploreAlgorithm final : public SynchronousExploreAlgorithm {
@@ -1352,13 +1402,15 @@ class TestPresentationWriter final : public PresentationNativeWriter {
     }
     ~TestPresentationWriter() override { state_->retirements.fetch_add(1U, std::memory_order_acq_rel); }
 
-    void Submit(VisualFrame frame, std::uint64_t selection_generation, const VisualSourceReader& reader) override {
+    void Submit(VisualSourceObservation observation, std::uint64_t selection_generation,
+                const VisualSourceReader& reader) override {
         context_.Bind();
         state_->context_bindings.fetch_add(1U, std::memory_order_acq_rel);
         const auto submission = state_->submissions.fetch_add(1U, std::memory_order_acq_rel);
         if (submission == 0U) state_->first_submission.set_value();
         if (submission == 2U) state_->third_submission.set_value();
         selection_generation_ = selection_generation;
+        const auto& frame = observation.frame;
         const auto width = frame.extent.width;
         const auto height = frame.extent.height;
         if (!Contains(active_, width, height)) {
@@ -1372,7 +1424,7 @@ class TestPresentationWriter final : public PresentationNativeWriter {
             }
         }
         const auto& target = Contains(active_, width, height) ? *active_ : *candidate_;
-        last_completed_ = frame;
+        last_completed_ = observation;
         reader_ = std::addressof(reader);
         pending_ = PresentationPublication{
             .capability =
@@ -1419,7 +1471,7 @@ class TestPresentationWriter final : public PresentationNativeWriter {
         const bool candidate_target = candidate_ && pending_->capability.generation == candidate_->generation;
         if (candidate_target && retiring_) return {.capability = capability()};
         auto source = reader_->borrow();
-        if (!visual_product_matches_frame(last_completed_, source)) {
+        if (!visual_product_matches_frame(last_completed_.frame, source)) {
             pending_.reset();
             reader_ = nullptr;
             return {
@@ -1444,6 +1496,7 @@ class TestPresentationWriter final : public PresentationNativeWriter {
             .selection_generation = selection_generation_,
             .publication = std::exchange(pending_, std::nullopt).value(),
             .capability = capability(),
+            .source_observation = last_completed_,
         };
         reader_ = nullptr;
         return outcome;
@@ -1489,7 +1542,7 @@ class TestPresentationWriter final : public PresentationNativeWriter {
     mmltk::frameworks::gpu::ImageStream stream_;
     mmltk::frameworks::gpu::ImageProductBuffer backbuffer_;
     std::shared_ptr<TestPresentationWriterState> state_;
-    VisualFrame last_completed_{};
+    VisualSourceObservation last_completed_{};
     const VisualSourceReader* reader_ = nullptr;
     std::uint64_t selection_generation_ = 0U;
     std::optional<PresentationPublication> pending_;
@@ -1623,7 +1676,8 @@ class OpenedExplore final {
     OpenedExplore(std::shared_ptr<FakeImageBackend> backend, const VisualExtent extent)
         : explore_(settings_.system(), kDevice, 2U,
                    RuntimeFactory(0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                                  [] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U)); }),
+                                  [] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U)); },
+                                  2U),
                    [this](ExploreSystem::event_type) { events_.Advance(); }) {
         static_cast<void>(
             explore_.Open({.viewport = {.extent = extent, .columns = extent.width / extent.height}, .compiled_source = "/test"}));
@@ -1651,7 +1705,7 @@ class ExploreScenario final {
     ExploreScenario(LoadedSettings& settings, std::shared_ptr<FakeImageBackend> backend, ModelFactory model = {}, Observer observer = {})
         : ExploreScenario(settings, 2U,
                           RuntimeFactory(0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                                         model ? std::move(model) : DefaultModel()),
+                                         model ? std::move(model) : DefaultModel(), 2U),
                           std::move(observer)) {}
 
     ExploreScenario(LoadedSettings& settings, const std::size_t nproc, VisualRuntimeFactory runtime, Observer observer = {})
@@ -1785,7 +1839,7 @@ void check_restored_filter(const ExploreSnapshot& restored, const ExploreSnapsho
     CHECK(restored.ready);
     CHECK(restored.filter == committed.filter);
     CHECK(restored.order.visible_indices == committed.order.visible_indices);
-    CHECK(restored.frame.revision > committed.frame.revision);
+    CHECK(restored.frame == committed.frame);
 }
 
 [[nodiscard]] bool assignments_match(const StreamingExploreProbe& probe, const std::span<const std::uint32_t> visible_indices) {
@@ -1860,7 +1914,10 @@ template <class System>
 [[nodiscard]] VisualSourceReader read_from(System& system) {
     return {
         .source = system.snapshot().frame.source,
-        .latest = [&system] { return system.snapshot().frame; },
+        .observe = [&system] {
+            const auto snapshot = system.snapshot();
+            return VisualSourceObservation{.frame = snapshot.frame, .snapshot_revision = snapshot.revision};
+        },
         .borrow = [&system] { return system.BorrowFrame(); },
     };
 }
@@ -1889,6 +1946,7 @@ class MutableVisualSource final {
         std::scoped_lock lock(mutex_);
         frame_ = visual_frame(identity_, extent, borrowed.plane(0U).revision());
         frame_.clean_revision = frame_.revision;
+        snapshot_revision_ = presentation::detail::advance_monotonic_identity(snapshot_revision_);
     }
     void SetSemantics(const std::uint8_t value) {
         const auto current = frame();
@@ -1896,6 +1954,7 @@ class MutableVisualSource final {
                          [value](const auto, const auto semantic, const auto) { Fill(semantic, value); });
         std::scoped_lock lock(mutex_);
         frame_.revision = runtime_.output().revision();
+        snapshot_revision_ = presentation::detail::advance_monotonic_identity(snapshot_revision_);
     }
     [[nodiscard]] VisualFrame frame() const {
         std::scoped_lock lock(mutex_);
@@ -1908,7 +1967,11 @@ class MutableVisualSource final {
     [[nodiscard]] VisualSourceReader reader() {
         return {
             .source = identity_,
-            .latest = [this] { return frame(); },
+            .observe =
+                [this] {
+                    std::scoped_lock lock(mutex_);
+                    return VisualSourceObservation{.frame = frame_, .snapshot_revision = snapshot_revision_};
+                },
             .borrow = [this] { return runtime_.Borrow(); },
         };
     }
@@ -1918,6 +1981,7 @@ class MutableVisualSource final {
     mmltk::frameworks::gpu::SystemImageRuntime runtime_;
     PresentationSourceIdentity identity_{PresentationSourceKind::Explore, 1U};
     VisualFrame frame_{};
+    std::uint64_t snapshot_revision_ = 0U;
 };
 
 struct UpscaleSourceFixture final {
@@ -1940,7 +2004,13 @@ class PresentationSourceFixture final {
               mmltk::frameworks::gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend_})),
           sources_{VisualSourceReader{
               .source = identity_,
-              .latest = [this] { return visual_frame(identity_, {16U, 16U}, latest_revision_.load(std::memory_order_acquire)); },
+              .observe =
+                  [this] {
+                      return VisualSourceObservation{
+                          .frame = visual_frame(identity_, {16U, 16U}, latest_revision_.load(std::memory_order_acquire)),
+                          .snapshot_revision = snapshot_revision_.load(std::memory_order_acquire),
+                      };
+                  },
               .borrow = [this] { return source_->Borrow(); },
           }} {
         source_->Publish(16U, 16U, [](auto, auto, auto) {});
@@ -1954,12 +2024,14 @@ class PresentationSourceFixture final {
         const auto borrowed = source_->Borrow();
         REQUIRE(borrowed.valid());
         latest_revision_.store(borrowed.plane(0U).revision(), std::memory_order_release);
+        snapshot_revision_.fetch_add(1U, std::memory_order_acq_rel);
     }
 
    private:
     std::shared_ptr<FakeImageBackend> backend_;
     std::unique_ptr<mmltk::frameworks::gpu::SystemImageRuntime> source_;
     std::atomic<std::uint64_t> latest_revision_{1U};
+    std::atomic<std::uint64_t> snapshot_revision_{1U};
     PresentationSourceIdentity identity_{PresentationSourceKind::Explore, 1U};
     std::array<VisualSourceReader, 1U> sources_;
 };
@@ -1983,7 +2055,13 @@ class ProductPresentationSources final {
             runtimes_.push_back(std::move(runtime));
             sources_.push_back({
                 .source = identity,
-                .latest = [identity, extent] { return visual_frame(identity, extent, 1U); },
+                .observe =
+                    [identity, extent] {
+                        return VisualSourceObservation{
+                            .frame = visual_frame(identity, extent, 1U),
+                            .snapshot_revision = 1U,
+                        };
+                    },
                 .borrow = [private_runtime] { return private_runtime->Borrow(); },
             });
         }
@@ -2241,7 +2319,7 @@ TEST_CASE("Explore render mutations abort queued lanes before failed cancelled a
         }
         REQUIRE(scenario.Wait([&] {
             const auto snapshot = explore.snapshot();
-            return !snapshot.busy && snapshot.revision > admitted.revision && snapshot.frame.revision > committed.frame.revision;
+            return !snapshot.busy && snapshot.revision > admitted.revision;
         }));
         // CLEANUP-IGNORE: Render-mutation restoration checks preview/detail facts; open failure checks catalog facts.
         const auto restored = explore.snapshot();
@@ -2349,8 +2427,9 @@ TEST_CASE("Explore Open rejects never-loaded settings before runtime constructio
     auto backend = std::make_shared<FakeImageBackend>();
     auto constructions = std::make_shared<std::atomic_uint64_t>(0U);
     auto events = std::make_shared<std::atomic_uint64_t>(0U);
-    auto factory = RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                                  [] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U)); });
+    auto factory = RuntimeFactory(
+        0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+        [] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U)); }, 2U);
     ExploreSystem explore{settings, kDevice, 2U,
                           [factory = std::move(factory), constructions]() mutable {
                               constructions->fetch_add(1U, std::memory_order_release);
@@ -2377,7 +2456,8 @@ TEST_CASE("Explore settings guards reject reopen and live filter before candidat
                                          [work] {
                                              return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U),
                                                                                            nullptr, nullptr, nullptr, work);
-                                         }),
+                                         },
+                                         2U),
                           [&events](ExploreSystem::event_type) { events.Advance(); }};
     static_cast<void>(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/test"}));
     REQUIRE(events.Wait([&] { return explore.snapshot().ready; }));
@@ -2415,7 +2495,7 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
                           kDevice,
                           4U,
                           RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                                         [observed_nproc] { return std::make_unique<TestExploreAlgorithm>(observed_nproc); }),
+                                         [observed_nproc] { return std::make_unique<TestExploreAlgorithm>(observed_nproc); }, 2U),
                           [&explore_events](ExploreSystem::event_type) { explore_events.Advance(); },
                           diagnostics.sink()};
     CHECK_FALSE(explore.BorrowFrame().valid());
@@ -2833,7 +2913,7 @@ TEST_CASE("Explore candidate allocation and render failures restore the committe
         CHECK(restored.order.matching_count == before.order.matching_count);
         CHECK(restored.order.shuffle_seed == before.order.shuffle_seed);
         CHECK(restored.order.visible_indices == before.order.visible_indices);
-        CHECK(restored.frame.revision > before.frame.revision);
+        CHECK(restored.frame == before.frame);
         CHECK_FALSE(restored.failure.empty());
         CHECK(fixture.commit_count() == 1U);
     };
@@ -2970,7 +3050,7 @@ TEST_CASE("Explore persistence failure retains the ready runtime product") {
     CHECK(failed.mode == prior.mode);
     CHECK(failed.selected_image == prior.selected_image);
     CHECK(failed.overlay.show_boxes == prior.overlay.show_boxes);
-    CHECK(failed.frame.revision > prior.frame.revision);
+    CHECK(failed.frame == prior.frame);
     REQUIRE(explore.BorrowFrame().valid());
     CHECK(explore.BorrowFrame().plane(0U).revision() == failed.frame.revision);
     CHECK(settings.system().snapshot().revision == persisted.revision);
@@ -3359,6 +3439,9 @@ TEST_CASE("Explore visibility preserves active augmentation and labels preserve 
     overlay.show_masks = !overlay.show_masks;
     static_cast<void>(scenario.system().UpdateOverlay(overlay));
     REQUIRE(scenario.Wait([&] { return scenario.system().snapshot().frame != before.frame; }));
+    const auto semantic = scenario.system().snapshot();
+    CHECK(semantic.frame.revision > before.frame.revision);
+    CHECK(semantic.frame.clean_revision == before.frame.clean_revision);
     CHECK(probe->rendered_copy_paste_probability.load(std::memory_order_acquire) == original);
 }
 
@@ -3431,7 +3514,7 @@ TEST_CASE("queued Explore cancellation is finalized by the scheduler callback") 
     CHECK(commits->load(std::memory_order_acquire) == 1U);
 
     gate->release.set_value();
-    REQUIRE(scenario.Wait([&] { return explore.snapshot().frame.revision > committed.frame.revision; }));
+    REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy; }));
     CHECK(explore.snapshot().viewport.extent == committed.viewport.extent);
     CHECK_FALSE(explore.snapshot().busy);
     CHECK(commits->load(std::memory_order_acquire) == 1U);
@@ -3466,14 +3549,14 @@ TEST_CASE("post-render Explore cancellation restores the committed gallery produ
         gate->release.set_value();
         REQUIRE(scenario.Wait([&] {
             const auto snapshot = explore.snapshot();
-            return !snapshot.busy && snapshot.frame.revision > before.frame.revision;
+            return !snapshot.busy && snapshot.revision > stopping.revision;
         }));
         const auto restored = explore.snapshot();
         CHECK(restored.filter == before.filter);
         CHECK(restored.order.visible_indices == before.order.visible_indices);
         CHECK(restored.mode == before.mode);
         CHECK(restored.selected_image == before.selected_image);
-        CHECK(restored.frame.revision > before.frame.revision);
+        CHECK(restored.frame == before.frame);
         REQUIRE(explore.BorrowFrame().valid());
         CHECK(explore.BorrowFrame().plane(0U).revision() == restored.frame.revision);
         CHECK(commits->load(std::memory_order_acquire) == 1U);
@@ -4454,7 +4537,7 @@ TEST_CASE("Presentation serializes consecutive growth through exact retirement a
 
     writer_state->AcknowledgeAllocationRetirement(generation_a);
     REQUIRE(events.Wait([&] { return presentation.snapshot().completed.source == source_c; }));
-    CHECK(presentation.snapshot().completed.revision == sources[4].latest().revision);
+    CHECK(presentation.snapshot().completed.revision == sources[4].observe().frame.revision);
     CHECK(presentation.snapshot().capability.generation > generation_b);
     CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 1U);
     CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == generation_b);
@@ -4581,6 +4664,7 @@ void publish_first_presentation(PresentationSystem& presentation, const Presenta
     static_cast<void>(presentation.Select(source.identity()));
     writer.SignalReadiness();
     REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 1U; }));
+    CHECK(presentation.snapshot().completed_source_revision == 1U);
 }
 
 TEST_CASE("Published frames retain their physical allocation while a waiting candidate is advertised") {
@@ -4702,6 +4786,7 @@ TEST_CASE("Presentation explicitly refreshes a selected private product") {
     });
     writer_state->SignalReadiness();
     REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 2U; }));
+    CHECK(presentation.snapshot().completed_source_revision == 2U);
     CHECK(writer_state->submissions.load(std::memory_order_acquire) == 2U);
     CHECK(writer_state->timeline.load(std::memory_order_acquire) == 2U);
     CHECK(presentation.snapshot().browser_completed_sample == 7U);
@@ -4716,6 +4801,7 @@ TEST_CASE("Presentation explicitly refreshes a selected private product") {
     writer_state->allow_publication.store(true, std::memory_order_release);
     writer_state->SignalReadiness();
     REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 4U; }));
+    CHECK(presentation.snapshot().completed_source_revision == 4U);
     CHECK(writer_state->submissions.load(std::memory_order_acquire) == 4U);
     CHECK(writer_state->timeline.load(std::memory_order_acquire) == 3U);
 
@@ -4861,6 +4947,75 @@ TEST_CASE("visual runtime reconstructs after consecutive factory failures") {
     REQUIRE(completed.get_future().wait_for(2s) == std::future_status::ready);
     CHECK(attempts->load(std::memory_order_acquire) == 3U);
     CHECK(failures->load(std::memory_order_acquire) == 2U);
+}
+
+TEST_CASE("visual producer revisions remain unique across staged runtime reconstruction") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
+    std::promise<std::uint64_t> first_completed;
+    std::promise<std::uint64_t> replacement_completed;
+    detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
+    REQUIRE(owner.SubmitOrdered([&first_completed](auto& runtime, std::stop_token) {
+        runtime.Publish(8U, 8U, [](auto, auto, auto) {});
+        const auto revision = runtime.output().revision();
+        return detail::VisualRuntimeOwner::Notification{
+            [&first_completed, revision] { first_completed.set_value(revision); }};
+    }));
+    const auto first_revision = first_completed.get_future().get();
+    REQUIRE(owner.SubmitDiscrete(
+        [&replacement_completed](auto& runtime, std::stop_token) {
+            runtime.Publish(8U, 8U, [](auto, auto, auto) {});
+            const auto revision = runtime.output().revision();
+            return detail::VisualRuntimeOwner::Notification{
+                [&replacement_completed, revision] { replacement_completed.set_value(revision); }};
+        },
+        {}, true));
+    const auto replacement_revision = replacement_completed.get_future().get();
+
+    CHECK(replacement_revision > first_revision);
+    owner.StopAndWait();
+}
+
+TEST_CASE("failed visual runtime replacement keeps the exact completed product") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
+    auto attempts = std::make_shared<std::atomic_uint32_t>(0U);
+    auto successful = test_live_runtime_factory(backend, captures);
+    std::promise<std::uint64_t> first_completed;
+    std::promise<void> failed;
+    detail::VisualRuntimeOwner owner{
+        [attempts, successful = std::move(successful)]() mutable {
+            if (attempts->fetch_add(1U, std::memory_order_acq_rel) == 1U)
+                throw std::runtime_error("deterministic replacement failure");
+            return successful();
+        },
+        [&failed](std::exception_ptr) { failed.set_value(); }};
+    REQUIRE(owner.SubmitOrdered([&first_completed](auto& runtime, std::stop_token) {
+        runtime.Publish(8U, 8U, [](auto, auto, auto) {});
+        const auto revision = runtime.output().revision();
+        return detail::VisualRuntimeOwner::Notification{
+            [&first_completed, revision] { first_completed.set_value(revision); }};
+    }));
+    const auto first_revision = first_completed.get_future().get();
+    REQUIRE(owner.SubmitDiscrete(no_op_visual_work, {}, true));
+    REQUIRE(failed.get_future().wait_for(2s) == std::future_status::ready);
+
+    auto retained = owner.Borrow();
+    REQUIRE(retained.valid());
+    CHECK(retained.plane(0U).revision() == first_revision);
+
+    std::promise<void> rejected;
+    REQUIRE(owner.SubmitDiscrete(
+        [&rejected](auto&, std::stop_token) {
+            return detail::VisualRuntimeOwner::Notification{[&rejected] { rejected.set_value(); }};
+        },
+        {}, true));
+    REQUIRE(rejected.get_future().wait_for(2s) == std::future_status::ready);
+    retained = owner.Borrow();
+    REQUIRE(retained.valid());
+    CHECK(retained.plane(0U).revision() == first_revision);
+    retained = {};
+    owner.StopAndWait();
 }
 
 // CLEANUP-IGNORE: Ordered replaceable-input semantics are independent from queued discrete cancellation.
@@ -5356,7 +5511,7 @@ TEST_CASE("recoverable visual failure restores creator policy before rebuilding 
     CHECK(backend->contexts_destroyed == 2U);
 }
 
-TEST_CASE("saved Explore transport changes retire the prior runtime before reopening") {
+TEST_CASE("saved Explore transport changes stage the prior runtime while reopening") {
     auto backend = std::make_shared<FakeImageBackend>();
     ExploreSystem* active = nullptr;
     LoadedSettings settings{[&](SettingsSystem::event_type) {

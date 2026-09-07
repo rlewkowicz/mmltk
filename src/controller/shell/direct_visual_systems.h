@@ -34,8 +34,9 @@ struct ApplicationSystemConfiguration final {
 class ApplicationSystemStorage final {
    public:
     using EventSink = std::function<void(browser::SystemEvent)>;
+    using ContinuitySink = std::function<void()>;
 
-    ApplicationSystemStorage(ApplicationSystemConfiguration, EventSink, VisualDiagnosticSink = {});
+    ApplicationSystemStorage(ApplicationSystemConfiguration, EventSink, VisualDiagnosticSink = {}, ContinuitySink = {});
     ~ApplicationSystemStorage();
 
     ApplicationSystemStorage(const ApplicationSystemStorage&) = delete;
@@ -64,6 +65,7 @@ class ApplicationSystemStorage final {
     // CLEANUP-IGNORE: ApplicationSystemStorage explicitly owns its system instances; a transport channel's queues do
     // not.
     EventSink events_;
+    ContinuitySink continuity_;
     std::unique_ptr<SettingsSystem> settings_;
     std::unique_ptr<FileDialogSystem> file_dialog_;
     std::unique_ptr<DatasetSystem> dataset_;
@@ -82,6 +84,7 @@ class ApplicationSystemStorage final {
 };
 
 [[nodiscard]] SystemEventSink<ExploreSystem::event_type> make_explore_upscale_event_sink(ApplicationSystemStorage::EventSink&,
-                                                                                         UpscaleSystem&);
+                                                                                         UpscaleSystem&,
+                                                                                         ApplicationSystemStorage::ContinuitySink = {});
 
 }  // namespace mmltk::controller::shell

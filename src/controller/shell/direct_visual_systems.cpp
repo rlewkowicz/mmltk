@@ -10,12 +10,23 @@ namespace mmltk::controller::shell {
 namespace {
 
 template <auto Member, class Variant>
-SystemEventSink<Variant> system_event_sink(ApplicationSystemStorage::EventSink& sink) {
-    return [&sink](Variant event) noexcept {
+SystemEventSink<Variant> system_event_sink(ApplicationSystemStorage::EventSink& sink,
+                                           ApplicationSystemStorage::ContinuitySink& continuity) {
+    return [&sink, &continuity](Variant event) noexcept {
         if (!sink) return;
         try {
             std::visit([&sink](const auto& value) { sink(browser::encode_system_event<Member>(value)); }, event);
-        } catch (...) {}
+        } catch (...) {
+            bool essential = false;
+            std::visit([&]<class Event>(const Event&) {
+                constexpr auto metadata = browser::application_schema_detail::annotation_value<
+                    ^^Event, contracts::reflection::Event>();
+                essential = metadata.delivery != contracts::reflection::EventDelivery::Transient;
+            }, event);
+            try {
+                if (essential && continuity) continuity();
+            } catch (...) {}
+        }
     };
 }
 
@@ -23,7 +34,10 @@ template <PresentationSourceKind Kind, class System>
 VisualSourceReader visual_source_reader(System& system) {
     return VisualSourceReader{
         .source = {Kind, 1U},
-        .latest = [&system] { return system.snapshot().frame; },
+        .observe = [&system] {
+            const auto snapshot = system.snapshot();
+            return VisualSourceObservation{.frame = snapshot.frame, .snapshot_revision = snapshot.revision};
+        },
         .borrow = [&system] { return system.BorrowFrame(); },
     };
 }
@@ -31,13 +45,18 @@ VisualSourceReader visual_source_reader(System& system) {
 }  // namespace
 
 SystemEventSink<ExploreSystem::event_type> make_explore_upscale_event_sink(ApplicationSystemStorage::EventSink& sink,
-                                                                           UpscaleSystem& upscale) {
-    return [&sink, &upscale](ExploreSystem::event_type event) noexcept {
+                                                                           UpscaleSystem& upscale,
+                                                                           ApplicationSystemStorage::ContinuitySink continuity) {
+    return [&sink, &upscale, continuity = std::move(continuity)](ExploreSystem::event_type event) noexcept {
         if (const auto* changed = std::get_if<ExploreChanged>(&event); changed != nullptr && changed->snapshot.ready) upscale.Warm();
         if (!sink) return;
         try {
             std::visit([&sink](const auto& value) { sink(browser::encode_system_event<&ApplicationSystems::explore>(value)); }, event);
-        } catch (...) {}
+        } catch (...) {
+            try {
+                if (continuity) continuity();
+            } catch (...) {}
+        }
     };
 }
 
@@ -59,11 +78,11 @@ std::unique_ptr<ExploreSystem> make_shell_explore_system(SettingsSystem& setting
 }
 
 ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguration configuration, EventSink events,
-                                                   const VisualDiagnosticSink diagnostics)
-    : events_(std::move(events)) {
+                                                   const VisualDiagnosticSink diagnostics, ContinuitySink continuity)
+    : events_(std::move(events)), continuity_(std::move(continuity)) {
     const auto borrow_exact = [this](const VisualFrame& frame) { return BorrowDocument(frame); };
     settings_ = std::make_unique<SettingsSystem>([this](SettingsSystem::event_type event) noexcept {
-        system_event_sink<&ApplicationSystems::settings, SettingsSystem::event_type>(events_)(std::move(event));
+        system_event_sink<&ApplicationSystems::settings, SettingsSystem::event_type>(events_, continuity_)(std::move(event));
         if (explore_) explore_->ExecutionSettingsChanged();
     });
     const auto initial_settings = settings_->Load(configuration.settings_location, configuration.h2d_dataloader);
@@ -73,13 +92,13 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
         [client = configuration.file_dialog, settings = settings_.get()] {
             return std::make_unique<NativeFileDialogRuntime>(client, *settings);
         },
-        system_event_sink<&ApplicationSystems::file_dialog, FileDialogSystem::event_type>(events_));
+        system_event_sink<&ApplicationSystems::file_dialog, FileDialogSystem::event_type>(events_, continuity_));
     dataset_ = std::make_unique<DatasetSystem>(
         *settings_, [] { return std::make_unique<ArtifactDatasetRuntime>(); },
-        system_event_sink<&ApplicationSystems::dataset, DatasetSystem::event_type>(events_));
+        system_event_sink<&ApplicationSystems::dataset, DatasetSystem::event_type>(events_, continuity_));
     model_ = std::make_unique<ModelSystem>(
         *settings_, [] { return std::make_unique<ArtifactModelRuntime>(); },
-        system_event_sink<&ApplicationSystems::model, ModelSystem::event_type>(events_));
+        system_event_sink<&ApplicationSystems::model, ModelSystem::event_type>(events_, continuity_));
     training_ = std::make_unique<TrainingSystem>(
         *settings_, *dataset_, *model_,
         [provider = configuration.provider, executable = std::move(configuration.training_executable)] {
@@ -88,30 +107,31 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
                 .training_executable = executable,
             });
         },
-        system_event_sink<&ApplicationSystems::training, TrainingSystem::event_type>(events_));
+        system_event_sink<&ApplicationSystems::training, TrainingSystem::event_type>(events_, continuity_));
     const DirectComputeConfiguration compute{
         .execution = resolve_visual_device_execution(configuration.base_visual),
     };
     validation_ = std::make_unique<ValidationSystem>(
         *settings_, *dataset_, *model_, [compute] { return std::make_unique<CudaValidationRuntime>(compute); },
-        system_event_sink<&ApplicationSystems::validation, ValidationSystem::event_type>(events_), compute.execution);
+        system_event_sink<&ApplicationSystems::validation, ValidationSystem::event_type>(events_, continuity_), compute.execution);
     export_ = std::make_unique<ExportSystem>(
         *settings_, *dataset_, *model_, [compute] { return std::make_unique<CudaExportRuntime>(compute); },
-        system_event_sink<&ApplicationSystems::export_system, ExportSystem::event_type>(events_), compute.execution);
+        system_event_sink<&ApplicationSystems::export_system, ExportSystem::event_type>(events_, continuity_), compute.execution);
     predict_ = std::make_unique<PredictSystem>(
         *settings_, *dataset_, *model_, configuration.base_visual, [compute] { return std::make_unique<CudaPredictRuntime>(compute); },
-        system_event_sink<&ApplicationSystems::predict, PredictSystem::event_type>(events_));
+        system_event_sink<&ApplicationSystems::predict, PredictSystem::event_type>(events_, continuity_));
     upscale_ = std::make_unique<UpscaleSystem>(
         configuration.output_visual, make_native_upscale_runtime_factory(configuration.output_visual), borrow_exact,
-        system_event_sink<&ApplicationSystems::upscale, UpscaleSystem::event_type>(events_), diagnostics);
-    explore_ = make_shell_explore_system(*settings_, configuration, *compute.execution, make_explore_upscale_event_sink(events_, *upscale_),
+        system_event_sink<&ApplicationSystems::upscale, UpscaleSystem::event_type>(events_, continuity_), diagnostics);
+    explore_ = make_shell_explore_system(*settings_, configuration, *compute.execution,
+                                         make_explore_upscale_event_sink(events_, *upscale_, continuity_),
                                          diagnostics);
     annotation_ = std::make_unique<AnnotationSystem>(
         configuration.output_visual, make_native_annotation_runtime_factory(configuration.output_visual), borrow_exact,
-        system_event_sink<&ApplicationSystems::annotation, AnnotationSystem::event_type>(events_), diagnostics);
+        system_event_sink<&ApplicationSystems::annotation, AnnotationSystem::event_type>(events_, continuity_), diagnostics);
     live_ = std::make_unique<LiveSystem>(configuration.base_visual,
                                          make_native_live_runtime_factory(configuration.base_visual, std::move(configuration.live)),
-                                         system_event_sink<&ApplicationSystems::live, LiveSystem::event_type>(events_), diagnostics);
+                                         system_event_sink<&ApplicationSystems::live, LiveSystem::event_type>(events_, continuity_), diagnostics);
 
     source_readers_ = {{
         visual_source_reader<PresentationSourceKind::Predict>(*predict_),
@@ -123,7 +143,8 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
     presentation_ = std::make_unique<PresentationSystem>(
         configuration.output_visual,
         make_native_presentation_writer_factory(configuration.output_visual, std::move(configuration.presentation), diagnostics),
-        source_readers_, system_event_sink<&ApplicationSystems::presentation, PresentationSystem::event_type>(events_), diagnostics);
+        source_readers_, system_event_sink<&ApplicationSystems::presentation, PresentationSystem::event_type>(events_, continuity_),
+        diagnostics);
     systems_.settings = settings_.get();
     systems_.file_dialog = file_dialog_.get();
     systems_.dataset = dataset_.get();

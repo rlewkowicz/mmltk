@@ -95,10 +95,14 @@ impl App {
             self.model
                 .set_foreground_feature(authoritative.settingsstate.currentview);
         }
+        if let Err(error) = self.model.completed_presentation_is_obsolete() {
+            self.retire_peer(error);
+            return;
+        }
         self.workspace.bootstrap_components(&self.model);
         self.reconcile_explore_viewport();
         self.sync_surface();
-        if let Some(frame) = self.model.presentation_refresh() {
+        if let Some(frame) = self.model.presentation_recovery_refresh() {
             self.select_presentation(frame);
         }
     }
@@ -160,6 +164,10 @@ impl App {
             installed_settings,
             &mut refresh,
         );
+        if let Err(error) = self.model.completed_presentation_is_obsolete() {
+            self.retire_peer(error);
+            return;
+        }
         self.sync_surface();
         if let Some(frame) = refresh {
             self.select_presentation(frame);
@@ -223,6 +231,10 @@ impl App {
                 self.model.explore.snapshot.as_ref(),
                 self.model.explore_mutation_available(),
             );
+        }
+        if let Err(error) = self.model.completed_presentation_is_obsolete() {
+            self.retire_peer(error);
+            return;
         }
         if let Some(frame) = refresh {
             self.select_presentation(frame);

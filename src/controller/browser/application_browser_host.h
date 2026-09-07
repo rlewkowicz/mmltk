@@ -21,6 +21,7 @@ class ApplicationBrowserHost final {
     [[nodiscard]] bool install(ApplicationSystems&) noexcept;
     [[nodiscard]] mmltk::frameworks::transport::BrowserServer::Callbacks callbacks() const noexcept;
     void publish(SystemEvent) noexcept;
+    void continuity_lost() noexcept;
     void close_admission() noexcept;
     [[nodiscard]] bool accepting() const noexcept;
 

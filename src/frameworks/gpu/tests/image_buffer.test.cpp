@@ -366,6 +366,9 @@ TEST_CASE("receiver selects same peer and reusable staged copy paths") {
     SystemImageRuntime staged{{.device = 2, .backend = backend}};
     CHECK(staged.CopyFrom(source.Borrow())[0U] == ImageCopyPath::PinnedStaging);
     CHECK(staged.CopyFrom(source.Borrow())[0U] == ImageCopyPath::PinnedStaging);
+    const auto copied_revision = staged.output().revision();
+    staged.Publish(16U, 8U, [](auto, auto, auto) {});
+    CHECK(staged.output().revision() > copied_revision);
     CHECK(backend->pinned_allocated == 1U);
     CHECK(backend->pinned_receiver_device == 2);
     CHECK(staged.output().staging_capacity_bytes() == 16U * 8U * 4U);
@@ -479,6 +482,132 @@ TEST_CASE("failed product growth never exposes mixed planes") {
     CHECK_THROWS(runtime.Publish(16U, 16U, [](auto, auto, auto) {}));
     CHECK(runtime.output().revision() == 0U);
     CHECK_FALSE(runtime.Borrow().valid());
+}
+
+TEST_CASE("product candidates preserve exact committed planes until readers release them") {
+    using namespace std::chrono_literals;
+    auto backend = std::make_shared<FakeImageBackend>();
+    SystemImageRuntime runtime{{
+        .device = 0,
+        .backend = backend,
+        .output_layout = ImageProductLayout::CleanAndSemantic,
+        .output_buffer_count = 2U,
+    }};
+    runtime.Publish(8U, 8U, [](const auto clean, const auto semantic, auto) {
+        std::memset(reinterpret_cast<void*>(clean.data), 0x21, clean.descriptor.pitch_bytes * clean.descriptor.height);
+        std::memset(reinterpret_cast<void*>(semantic.data), 0x43, semantic.descriptor.pitch_bytes * semantic.descriptor.height);
+    });
+    auto incumbent = runtime.Borrow();
+    REQUIRE(incumbent.valid());
+    const auto incumbent_revision = incumbent.plane(0U).revision();
+
+    auto candidate = runtime.AcquireOutput();
+    REQUIRE(candidate.valid());
+    runtime.Publish(candidate, 8U, 8U, ImageCandidateInitialization::PreserveSelected,
+                    [](const auto, const auto semantic, auto) {
+                        std::memset(reinterpret_cast<void*>(semantic.data), 0x65,
+                                    semantic.descriptor.pitch_bytes * semantic.descriptor.height);
+                    });
+    const auto candidate_revision = candidate.revision();
+    CHECK(candidate_revision > incumbent_revision);
+    CHECK(runtime.Borrow().plane(0U).revision() == incumbent_revision);
+    runtime.CommitOutput(std::move(candidate));
+
+    auto committed = runtime.Borrow();
+    REQUIRE(committed.valid());
+    CHECK(committed.plane(0U).revision() == candidate_revision);
+    CHECK(*reinterpret_cast<const std::uint8_t*>(committed.plane(0U).plane().data) == 0x21U);
+    CHECK(*reinterpret_cast<const std::uint8_t*>(committed.plane(1U).plane().data) == 0x65U);
+    CHECK(*reinterpret_cast<const std::uint8_t*>(incumbent.plane(1U).plane().data) == 0x43U);
+
+    std::stop_source stop;
+    auto admission = std::async(std::launch::async, [&runtime, token = stop.get_token()] {
+        return runtime.AcquireOutput(token);
+    });
+    CHECK(admission.wait_for(10ms) == std::future_status::timeout);
+    incumbent = {};
+    REQUIRE(admission.wait_for(1s) == std::future_status::ready);
+    CHECK(admission.get().valid());
+}
+
+TEST_CASE("completed products retain exact pixels and can be selected again") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    SystemImageRuntime runtime{{
+        .device = 0,
+        .backend = backend,
+        .output_buffer_count = 3U,
+    }};
+
+    auto first_candidate = runtime.AcquireOutput();
+    REQUIRE(first_candidate.valid());
+    runtime.Publish(first_candidate, 8U, 8U, ImageCandidateInitialization::Empty, [](const auto clean, const auto, auto) {
+        std::memset(reinterpret_cast<void*>(clean.data), 0x31, clean.descriptor.pitch_bytes * clean.descriptor.height);
+    });
+    auto first = runtime.CommitOutput(std::move(first_candidate));
+    REQUIRE(first.valid());
+
+    auto second_candidate = runtime.AcquireOutput();
+    REQUIRE(second_candidate.valid());
+    runtime.Publish(second_candidate, 8U, 8U, ImageCandidateInitialization::Empty, [](const auto clean, const auto, auto) {
+        std::memset(reinterpret_cast<void*>(clean.data), 0x52, clean.descriptor.pitch_bytes * clean.descriptor.height);
+    });
+    auto second = runtime.CommitOutput(std::move(second_candidate));
+    REQUIRE(second.valid());
+    REQUIRE(runtime.Borrow().valid());
+    CHECK(*reinterpret_cast<const std::uint8_t*>(runtime.Borrow().plane(0U).plane().data) == 0x52U);
+
+    runtime.SelectOutput(first);
+    auto selected = runtime.Borrow();
+    REQUIRE(selected.valid());
+    CHECK(selected.plane(0U).revision() == first.revision());
+    CHECK(*reinterpret_cast<const std::uint8_t*>(selected.plane(0U).plane().data) == 0x31U);
+    auto later = second.Borrow();
+    REQUIRE(later.valid());
+    CHECK(*reinterpret_cast<const std::uint8_t*>(later.plane(0U).plane().data) == 0x52U);
+
+    auto remaining = runtime.AcquireOutput();
+    CHECK(remaining.valid());
+}
+
+TEST_CASE("failed candidate growth retains the committed product and later initializes every plane") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    SystemImageRuntime runtime{{
+        .device = 0,
+        .backend = backend,
+        .output_layout = ImageProductLayout::CleanAndSemantic,
+        .output_buffer_count = 2U,
+    }};
+    runtime.Publish(8U, 8U, [](const auto clean, const auto semantic, auto) {
+        std::memset(reinterpret_cast<void*>(clean.data), 0x17, clean.descriptor.pitch_bytes * clean.descriptor.height);
+        std::memset(reinterpret_cast<void*>(semantic.data), 0x29, semantic.descriptor.pitch_bytes * semantic.descriptor.height);
+    });
+    const auto committed_revision = runtime.output().revision();
+
+    {
+        auto candidate = runtime.AcquireOutput();
+        REQUIRE(candidate.valid());
+        backend->FailAfter(FakeImageBackend::FailurePoint::AllocatePlane, 1U);
+        CHECK_THROWS(runtime.Publish(candidate, 16U, 16U, ImageCandidateInitialization::PreserveSelected,
+                                     [](auto, auto, auto) {}));
+    }
+    auto retained = runtime.Borrow();
+    REQUIRE(retained.valid());
+    CHECK(retained.plane(0U).revision() == committed_revision);
+    CHECK(*reinterpret_cast<const std::uint8_t*>(retained.plane(0U).plane().data) == 0x17U);
+    retained = {};
+
+    auto replacement = runtime.AcquireOutput();
+    REQUIRE(replacement.valid());
+    runtime.Publish(replacement, 16U, 16U, ImageCandidateInitialization::PreserveSelected,
+                    [](const auto clean, const auto, auto) {
+                        *reinterpret_cast<std::uint8_t*>(clean.data) = 0x7BU;
+                    });
+    runtime.CommitOutput(std::move(replacement));
+    auto completed = runtime.Borrow();
+    REQUIRE(completed.valid());
+    CHECK(*reinterpret_cast<const std::uint8_t*>(completed.plane(0U).plane().data) == 0x7BU);
+    CHECK(*(reinterpret_cast<const std::uint8_t*>(completed.plane(0U).plane().data) + 1U) == 0U);
+    CHECK(*reinterpret_cast<const std::uint8_t*>(completed.plane(1U).plane().data) == 0U);
 }
 
 TEST_CASE("failed product completion invalidates the whole transaction") {

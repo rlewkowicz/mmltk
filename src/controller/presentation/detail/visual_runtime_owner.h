@@ -72,6 +72,8 @@ class VisualRuntimeOwner final {
     using RetainedRuntime = std::variant<std::monostate, Runtime::UnsafeCustody>;
     void Run(std::stop_token);
     void Failed(std::exception_ptr) noexcept;
+    void BeginRuntimeReplacement();
+    void CompleteRuntimeReplacement();
     void RetireRuntime();
     void FlushLatest();
     void Observe(ActivityStage, std::uint64_t value = 0U) const noexcept;
@@ -89,6 +91,9 @@ class VisualRuntimeOwner final {
     static constexpr std::uint8_t kContinuationPending = 2U;
     std::atomic<std::uint8_t> continuation_state_{0U};
     std::unique_ptr<Runtime> runtime_;
+    std::unique_ptr<Runtime> replacement_fallback_;
+    std::shared_ptr<std::atomic<std::uint64_t>> product_revision_sequence_{
+        std::make_shared<std::atomic<std::uint64_t>>(1U)};
     std::optional<mmltk::common::system::ScopedExecutionPolicy> execution_policy_;
     RetainedRuntime retained_;
     std::stop_source active_stop_{std::nostopstate};
@@ -96,6 +101,7 @@ class VisualRuntimeOwner final {
     bool active_discrete_ = false;
     bool terminal_barrier_active_ = false;
     bool runtime_retirement_blocked_ = false;
+    bool preserve_runtime_on_failure_ = false;
     bool stopping_ = false;
     mmltk::frameworks::gpu::SystemImageWorker worker_;
 };

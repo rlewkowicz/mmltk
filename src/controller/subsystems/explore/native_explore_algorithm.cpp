@@ -336,6 +336,8 @@ class GalleryStream final {
     [[nodiscard]] ExploreGalleryPublication Advance();
     [[nodiscard]] bool HasReadyTiles() const;
     void PrepareOutputPublication();
+    void CommitOutputPublication() noexcept;
+    [[nodiscard]] bool RollbackOutputPublication() noexcept;
     [[nodiscard]] ExploreGalleryPublication PublishTiles(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView,
                                                          std::uintptr_t);
     void RenderDetail(const ExploreRenderPlan&, const mmltk::backend::data::CompiledDataset&, std::span<const std::uint32_t>,
@@ -396,6 +398,26 @@ class GalleryStream final {
         std::vector<explore::ExploreRenderAnnotationDescriptor> annotations;
         std::vector<data::RLEPair> runs;
     };
+    struct LogicalCheckpoint final {
+        cudaStream_t stream = nullptr;
+        const mmltk::backend::data::CompiledDataset* store = nullptr;
+        ExploreViewport viewport{};
+        ExploreOverlay overlay{};
+        ExploreRenderPlan plan{};
+        std::shared_ptr<const VisualDocument> document;
+        explore::ExploreRenderDetailView detail_view{};
+        std::vector<std::uint32_t> visible_indices;
+        std::vector<std::uint32_t> prefetch_indices;
+        std::span<const std::uint32_t> annotated_indices;
+        std::vector<explore::ExploreRenderClassDescriptor> active_classes;
+        std::vector<std::uint32_t> priority_slots;
+        std::vector<bool> completed_slots;
+        std::size_t cumulative_tiles = 0U;
+        std::size_t reused_tiles = 0U;
+        std::size_t cache_active = 0U;
+        std::optional<ExploreRenderPlan> cached_plan;
+        std::vector<std::shared_ptr<const TileMeaning>> tile_meanings;
+    };
     struct Lane final {
         Lane(const std::size_t lane_index, const data::CompiledImageStream::Buffer& storage) : pinned(storage), index(lane_index) {}
         const data::CompiledImageStream::Buffer& pinned;
@@ -411,7 +433,6 @@ class GalleryStream final {
         std::uint32_t first_row = 0U;
         std::uint64_t preview_key = 0U;
         bool prefetch = false;
-        bool retained_completion = false;
         bool transfer_ready = false;
         std::uint32_t donor_index = 0U;
         std::optional<data::PackedInstance> donor_instance;
@@ -492,14 +513,15 @@ class GalleryStream final {
     std::vector<rfdetr::AugmentationPreviewAnnotation> projected_annotations_;
     std::vector<std::uint32_t> priority_slots_;
     std::vector<bool> completed_slots_;
-    std::vector<bool> retained_ready_slots_;
-    bool retained_completion_scheduled_ = false;
     std::size_t next_priority_ = 0U;
     std::size_t cumulative_tiles_ = 0U;
     std::size_t reused_tiles_ = 0U;
     std::size_t cache_active_ = 0U;
     std::optional<ExploreRenderPlan> cached_plan_;
     std::vector<std::shared_ptr<const TileMeaning>> tile_meanings_;
+    LogicalCheckpoint checkpoint_;
+    bool checkpoint_active_ = false;
+    bool rollback_failed_ = false;
     ExploreHostAllocations host_allocations_;
     NativeExploreStorage storage_;
     std::unique_ptr<rfdetr::GpuAugmentationExecutor> augmenter_;
@@ -658,7 +680,6 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
         render_classes_.clear();
     }
     void DiscardCandidate() override {
-        AbortRenderGeneration();
         open_candidate_.reset();
         candidate_filter_ = {};
         candidate_order_.clear();
@@ -720,6 +741,8 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
     void SetGalleryReadySink(GalleryReadySink sink) override { gallery_.SetReadySink(std::move(sink)); }
 
     void PrepareOutputPublication() override { gallery_.PrepareOutputPublication(); }
+    void CommitOutputPublication() noexcept override { gallery_.CommitOutputPublication(); }
+    [[nodiscard]] bool RollbackOutputPublication() noexcept override { return gallery_.RollbackOutputPublication(); }
 
     [[nodiscard]] ExploreGalleryPublication BeginGallery(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate,
                                                          const std::size_t nproc, const mmltk::frameworks::gpu::ImagePlaneView clean,
@@ -954,8 +977,6 @@ ExploreGalleryPublication GalleryStream::Begin(const ExploreRenderPlan& plan, st
     reused_tiles_ = 0U;
     next_priority_ = 0U;
     completed_slots_.assign(visible_indices_.size(), false);
-    retained_ready_slots_.assign(visible_indices_.size(), false);
-    retained_completion_scheduled_ = false;
     scheduled_slots_.assign(visible_indices_.size(), false);
     Prioritize(plan.focused_image);
     {
@@ -1005,8 +1026,12 @@ ExploreGalleryPublication GalleryStream::Begin(const ExploreRenderPlan& plan, st
         copy(clean, storage_.buffers_.cached_clean_);
         copy(semantic, storage_.buffers_.cached_semantic_);
         CacheTile(clean, semantic, static_cast<std::uint32_t>(slot), stream);
-        retained_ready_slots_[slot] = same_content && previous_completed[found->second];
-        scheduled_slots_[slot] = retained_ready_slots_[slot];
+        completed_slots_[slot] = same_content && previous_completed[found->second];
+        scheduled_slots_[slot] = completed_slots_[slot];
+        if (completed_slots_[slot]) {
+            ++cumulative_tiles_;
+            ++reused_tiles_;
+        }
     }
     cached_plan_ = plan;
     // Opt-in content diagnostics project the retained semantic descriptors too,
@@ -1029,7 +1054,9 @@ ExploreGalleryPublication GalleryStream::Begin(const ExploreRenderPlan& plan, st
                       .generation = plan.generation,
                       .value = visible_indices_.size()});
     }
-    return PublicationFacts(stale_discarded_.exchange(0U, std::memory_order_acq_rel));
+    auto publication = PublicationFacts(stale_discarded_.exchange(0U, std::memory_order_acq_rel));
+    publication.reused_tiles = std::exchange(reused_tiles_, 0U);
+    return publication;
 }
 
 ExploreGalleryPublication GalleryStream::Advance() {
@@ -1105,8 +1132,86 @@ bool GalleryStream::HasReadyTiles() const {
 }
 
 void GalleryStream::PrepareOutputPublication() {
+    if (rollback_failed_) throw std::runtime_error("Explore publication rollback previously failed");
+    if (checkpoint_active_) return;
     SettleDescriptors();
     CompleteTiles(true);
+    checkpoint_.stream = stream_;
+    checkpoint_.store = store_;
+    checkpoint_.viewport = viewport_;
+    checkpoint_.overlay = overlay_;
+    checkpoint_.plan = plan_;
+    checkpoint_.document = document_;
+    checkpoint_.detail_view = detail_view_;
+    checkpoint_.visible_indices = visible_indices_;
+    checkpoint_.prefetch_indices = prefetch_indices_;
+    checkpoint_.annotated_indices = annotated_indices_;
+    checkpoint_.active_classes = active_classes_;
+    checkpoint_.priority_slots = priority_slots_;
+    checkpoint_.completed_slots = completed_slots_;
+    checkpoint_.cumulative_tiles = cumulative_tiles_;
+    checkpoint_.reused_tiles = reused_tiles_;
+    checkpoint_.cache_active = cache_active_;
+    checkpoint_.cached_plan = cached_plan_;
+    checkpoint_.tile_meanings = tile_meanings_;
+    checkpoint_active_ = true;
+}
+
+void GalleryStream::CommitOutputPublication() noexcept {
+    checkpoint_active_ = false;
+    checkpoint_.document.reset();
+    checkpoint_.visible_indices.clear();
+    checkpoint_.prefetch_indices.clear();
+    checkpoint_.active_classes.clear();
+    checkpoint_.priority_slots.clear();
+    checkpoint_.completed_slots.clear();
+    checkpoint_.cached_plan.reset();
+    checkpoint_.tile_meanings.clear();
+}
+
+bool GalleryStream::RollbackOutputPublication() noexcept {
+    if (rollback_failed_) return false;
+    if (!checkpoint_active_) return true;
+    try {
+        Quiesce();
+        stream_ = checkpoint_.stream;
+        store_ = checkpoint_.store;
+        viewport_ = checkpoint_.viewport;
+        overlay_ = checkpoint_.overlay;
+        plan_ = checkpoint_.plan;
+        document_.swap(checkpoint_.document);
+        detail_view_ = checkpoint_.detail_view;
+        visible_indices_.swap(checkpoint_.visible_indices);
+        prefetch_indices_.swap(checkpoint_.prefetch_indices);
+        annotated_indices_ = checkpoint_.annotated_indices;
+        active_classes_.swap(checkpoint_.active_classes);
+        priority_slots_.swap(checkpoint_.priority_slots);
+        completed_slots_.swap(checkpoint_.completed_slots);
+        cumulative_tiles_ = checkpoint_.cumulative_tiles;
+        reused_tiles_ = checkpoint_.reused_tiles;
+        cache_active_ = checkpoint_.cache_active;
+        cached_plan_.swap(checkpoint_.cached_plan);
+        tile_meanings_.swap(checkpoint_.tile_meanings);
+        CommitOutputPublication();
+        next_priority_ = 0U;
+        next_prefetch_ = 0U;
+        scheduled_slots_.assign(completed_slots_.size(), false);
+        for (std::size_t slot = 0U; slot != completed_slots_.size(); ++slot)
+            scheduled_slots_[slot] = completed_slots_[slot];
+        desired_generation_.store(plan_.generation, std::memory_order_release);
+        std::shared_ptr<const ExploreAlgorithm::GalleryReadySink> sink;
+        {
+            std::scoped_lock lock(lanes_mutex_);
+            sink = ready_sink_;
+        }
+        if (sink) (*sink)();
+        return true;
+    } catch (...) {
+        checkpoint_active_ = false;
+        ClearLogicalState();
+        rollback_failed_ = true;
+        return false;
+    }
 }
 
 void GalleryStream::CompleteTiles(const bool synchronized) {
@@ -1122,17 +1227,6 @@ void GalleryStream::CompleteTiles(const bool synchronized) {
                           .detail = visible_indices_[slot]});
     };
     for (auto& lane : lanes_) {
-        if (lane->retained_completion && lane->generation == generation &&
-            (lane->state == LaneState::GpuComplete || (synchronized && lane->state == LaneState::GpuPending))) {
-            for (std::size_t slot = 0U; slot < retained_ready_slots_.size(); ++slot)
-                if (retained_ready_slots_[slot] && !completed_slots_[slot]) {
-                    completed_slots_[slot] = true;
-                    ++cumulative_tiles_;
-                    ++reused_tiles_;
-                    observe(slot);
-                }
-            lane->retained_completion = false;
-        }
         if (!lane->pending_meaning) continue;
         if (lane->generation == generation && lane->destination_slot < visible_indices_.size() &&
             visible_indices_[lane->destination_slot] == lane->compiled_index &&
@@ -1189,7 +1283,6 @@ GalleryStream::PayloadLayout GalleryStream::LayoutFor(const std::uint32_t compil
 void GalleryStream::PrepareLaneStorage(Lane& lane, const std::uint32_t compiled_index, const std::uint32_t slot,
                                        const std::uint64_t generation) {
     image_stream_.bind_current_context();
-    lane.retained_completion = false;
     lane.transfer_ready = false;
     lane.pending_meaning.reset();
     lane.preview_key = rfdetr::augmentation_preview_image_key(plan_.dataset_identity, plan_.augmentation.seed, compiled_index);
@@ -1499,29 +1592,6 @@ void GalleryStream::Prioritize(const std::optional<std::uint32_t> focused_image)
 }
 
 void GalleryStream::StartIdleLanes() {
-    // Reused pixels and recomposed semantics need the same physical completion
-    // boundary as new images. An available lane owns that event, without a new
-    // buffer, timer or separate completion worker.
-    if (!retained_completion_scheduled_ && std::ranges::any_of(retained_ready_slots_, [](bool ready) { return ready; })) {
-        Lane* completion = nullptr;
-        {
-            std::scoped_lock lock(lanes_mutex_);
-            for (auto& lane : lanes_)
-                if (lane->state == LaneState::Idle) {
-                    completion = lane.get();
-                    lane->generation = desired_generation_.load(std::memory_order_acquire);
-                    lane->retained_completion = true;
-                    lane->pending_meaning.reset();
-                    lane->state = LaneState::GpuPending;
-                    retained_completion_scheduled_ = true;
-                    break;
-                }
-        }
-        if (completion) {
-            image_stream_.bind_current_context();
-            image_stream_.fence(completion->index, stream_, LaneCompletion());
-        }
-    }
     for (std::size_t lane_index = 0U; lane_index != lanes_.size(); ++lane_index) {
         std::uint32_t slot = 0U;
         std::uint32_t compiled_index = 0U;
@@ -1985,6 +2055,9 @@ ExploreGalleryPublication GalleryStream::PublishTiles(const mmltk::frameworks::g
     for (Lane* const lane : ready_lanes) {
         ReleaseLane(*lane);
     }
+    // The output candidate owns overlay completion. Source lanes may remain
+    // unavailable until their independent release callbacks arrive.
+    CompleteTiles(true);
     return PublicationFacts(0U);
 }
 
@@ -2534,6 +2607,8 @@ void GalleryStream::Quiesce() {
 }
 
 void GalleryStream::ClearLogicalState() {
+    checkpoint_ = {};
+    checkpoint_active_ = false;
     document_.reset();
     cached_plan_.reset();
     tile_meanings_.clear();
@@ -2573,7 +2648,6 @@ void GalleryStream::ClearLogicalState() {
         lane->donor_index = 0U;
         lane->donor_instance.reset();
         lane->pending_meaning.reset();
-        lane->retained_completion = false;
         lane->failure = {};
     }
 }
@@ -2581,8 +2655,6 @@ void GalleryStream::ClearLogicalState() {
 void GalleryStream::ClearReadinessState() {
     priority_slots_.clear();
     completed_slots_.clear();
-    retained_ready_slots_.clear();
-    retained_completion_scheduled_ = false;
     next_priority_ = 0U;
     cumulative_tiles_ = 0U;
     reused_tiles_ = 0U;
@@ -2648,6 +2720,7 @@ VisualRuntimeFactory make_native_explore_runtime_factory(const VisualDeviceSetti
             .device = settings.device,
             .model = std::make_unique<explore_detail::NativeExploreAlgorithm>(configuration, nproc, execution),
             .output_layout = mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+            .output_buffer_count = 2U,
             .numa_node = settings.numa_node,
             .execution = execution,
         });

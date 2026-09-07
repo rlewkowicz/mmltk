@@ -67,6 +67,12 @@ struct VisualFrame final {
     bool operator==(const VisualFrame&) const = default;
     [[nodiscard]] constexpr bool valid() const noexcept { return source.valid() && extent.valid() && revision != 0U; }
 };
+struct VisualSourceObservation final {
+    VisualFrame frame{};
+    std::uint64_t snapshot_revision = 0U;
+    bool operator==(const VisualSourceObservation&) const = default;
+    [[nodiscard]] constexpr bool valid() const noexcept { return frame.valid() && snapshot_revision != 0U; }
+};
 [[nodiscard]] bool visual_product_matches_frame(const VisualFrame&, const mmltk::frameworks::gpu::BorrowedImageProductReadView&) noexcept;
 [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView borrow_matching_visual_product(
     const VisualFrame&, mmltk::frameworks::gpu::BorrowedImageProductReadView);
@@ -285,5 +291,6 @@ MMLTK_REFLECT_FIELDS(VisualDeviceSettings)
 MMLTK_REFLECT_FIELDS(VisualExtent)
 MMLTK_REFLECT_FIELDS(VisualRegion)
 MMLTK_REFLECT_FIELDS(VisualFrame)
+MMLTK_REFLECT_FIELDS(VisualSourceObservation)
 
 }  // namespace mmltk::controller

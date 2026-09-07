@@ -105,7 +105,8 @@ ApplicationShell::ApplicationShell(ApplicationShellConfig config)
                                        .file_dialog = file_dialog_owner_.client(),
                                        .provider = provider_owner_.client(),
                                        .training_executable = std::move(config.training_executable)},
-        [this](browser::SystemEvent event) { browser_host_.publish(std::move(event)); }, diagnostics);
+        [this](browser::SystemEvent event) { browser_host_.publish(std::move(event)); }, diagnostics,
+        [this] { browser_host_.continuity_lost(); });
     if (!browser_host_.install(systems_->application_systems())) {
         browser_host_.close_admission();
         request_system_stops();

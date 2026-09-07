@@ -1135,7 +1135,7 @@ void test_compiled_explore_ring_holes_survive_hidden_donor_and_transfer() {
     system.Shutdown();
 }
 
-void test_compiled_explore_cancelled_lane_retained_completion() {
+void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
     const bool h2d = GENERATE(true, false);
     INFO("h2d_dataloader=" << h2d);
     require_explore_transport(h2d);
@@ -1245,8 +1245,8 @@ void test_compiled_explore_cancelled_lane_retained_completion() {
     const auto placeholders = audit.placeholder_count();
     system.UpdateViewport({.viewport = viewport(4U)});
     REQUIRE(audit.Wait([&] { return audit.placeholder_count() > placeholders; }));
-    // Wake the superseded read. The new generation retains tiles 0 and 1 and
-    // must fence their GPU copies on that same lane, without an input borrower.
+    // Wake the superseded read. The new generation retains tiles 0 and 1 on
+    // its output candidate boundary, without an input borrower.
     send(1U);
     REQUIRE(audit.Wait([&] {
         const auto snapshot = system.snapshot();
@@ -1300,7 +1300,7 @@ void test_compiled_explore_cancelled_lane_retained_completion() {
 
 MMLTK_REGISTER_TEST_CASE("[acceptance][backend-data][explore]", test_compiled_dataset_explore_projection_navigation_and_streaming);
 MMLTK_REGISTER_TEST_CASE("[acceptance][backend-data][explore][capacity]", test_compiled_explore_optional_donors_respect_source_capacity);
-MMLTK_REGISTER_TEST_CASE("[acceptance][backend-data][explore][completion]", test_compiled_explore_cancelled_lane_retained_completion);
+MMLTK_REGISTER_TEST_CASE("[acceptance][backend-data][explore][completion]", test_compiled_explore_cancelled_lane_preserves_atomic_product);
 
 MMLTK_REGISTER_TEST_CASE("[acceptance][backend-data][explore][support]", test_compiled_explore_magnified_tiny_mask_and_transfer);
 MMLTK_REGISTER_TEST_CASE("[acceptance][explore][copy_paste]", test_compiled_explore_ring_holes_survive_hidden_donor_and_transfer);
