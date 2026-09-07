@@ -10,11 +10,11 @@ mmltk_register_public_headers(
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES explore_system.h)
 mmltk_register_ordinary_sources(
-    mmltk_controller_explore_system explore_system.cpp)
+    mmltk_controller_explore_system explore_system.cpp native_explore_storage.cpp)
 mmltk_register_private_headers(
-    mmltk_controller_explore_system native_explore_storage.h)
+    mmltk_controller_explore_system native_explore_storage.h detail/gallery_stream.h)
 mmltk_register_retained_module_importers(
-    mmltk_controller_explore_system native_explore_algorithm.cpp)
+    mmltk_controller_explore_system native_explore_algorithm.cpp gallery_stream.cpp)
 target_link_libraries(mmltk_controller_explore_system
     PUBLIC
         mmltk::controller::application_boundary

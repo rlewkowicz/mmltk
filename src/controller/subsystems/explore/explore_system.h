@@ -206,6 +206,9 @@ class ExploreAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
     [[nodiscard]] virtual std::vector<ExploreLabel> Labels() const { return {}; }
     [[nodiscard]] virtual std::optional<std::uint32_t> Adjacent(std::uint32_t, std::int64_t offset) const = 0;
     virtual void SetGalleryReadySink(GalleryReadySink) = 0;
+    // Logical candidate meaning follows the prepared GPU output. Commit this
+    // publication before committing its order; discard an order only after
+    // checked rollback. False means physical completion requires retirement.
     virtual void PrepareOutputPublication() = 0;
     virtual void CommitOutputPublication() noexcept = 0;
     [[nodiscard]] virtual bool RollbackOutputPublication() noexcept = 0;
@@ -266,6 +269,19 @@ class ExploreSystem final {
 
 class ExploreAcceptanceGate final {
    public:
+    enum class PublicationStage : std::uint8_t { None, DescriptorsPrepared, ProductPrepared };
+    struct ProductObservation final {
+        bool released = false;
+        std::weak_ptr<const void> artifact;
+        std::size_t logical_size = 0U;
+        std::size_t capacity_before = 0U;
+        std::size_t capacity_after = 0U;
+    };
+    // Test controls are installed before constructing the native runtime.
+    void SetProductObserver(void*, void (*)(void*, ProductObservation) noexcept) noexcept;
+    void ObserveProduct(ProductObservation) const noexcept;
+    void FailNextPublicationAt(PublicationStage) noexcept;
+    void CheckPublication(PublicationStage) const;
     enum class WaitResult : std::uint8_t {
         Proceed,
         Stale,

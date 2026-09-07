@@ -363,6 +363,10 @@ struct StreamingExploreProbe final {
     std::size_t quiescences = 0U;
     std::size_t aborted_assignments = 0U;
     bool fail_next_render = false;
+    bool fail_next_labels = false;
+    bool fail_rollback = false;
+    std::size_t rollbacks = 0U;
+    std::string opened_source;
     std::shared_ptr<ExplorePostRenderGate> render_gate;
 
    private:
@@ -394,7 +398,9 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
         probe_->ready_sink = {};
     }
 
-    ExploreOpened Open(std::string_view, std::stop_token) override {
+    ExploreOpened Open(const std::string_view source, std::stop_token) override {
+        std::scoped_lock lock(probe_->mutex);
+        probe_->opened_source = source;
         order_ = {0U, 1U, 2U, 3U, 4U, 5U};
         return {
             .dataset = {.image_count = 6U, .image_width = 4U, .image_height = 4U},
@@ -451,6 +457,8 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
         {
             std::scoped_lock lock(probe_->mutex);
             if (!checkpoint_) return true;
+            ++probe_->rollbacks;
+            if (probe_->fail_rollback) return false;
             ++probe_->quiescences;
             probe_->aborted_assignments += probe_->assignments.size();
             probe_->assignments = std::move(checkpoint_->assignments);
@@ -467,6 +475,12 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
         }
         if (wake) wake();
         return true;
+    }
+    std::vector<ExploreLabel> Labels() const override {
+        std::scoped_lock lock(probe_->mutex);
+        if (std::exchange(probe_->fail_next_labels, false))
+            throw std::runtime_error("deterministic Explore prepared-label failure");
+        return {};
     }
     ExploreGalleryPublication BeginGallery(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc,
                                            const mmltk::frameworks::gpu::ImagePlaneView clean,
@@ -2266,6 +2280,7 @@ TEST_CASE("Explore filter rollback quiesces candidate lanes before restoring com
     CHECK(restored.ready);
     CHECK(restored.order.visible_indices == committed.order.visible_indices);
     CHECK(restored.filter == committed.filter);
+    CHECK(restored.frame == committed.frame);
     CHECK_FALSE(restored.failure.empty());
     REQUIRE(scenario.probe().Wait([&] { return scenario.probe().assignments.size() == 2U; }));
     {
@@ -2276,6 +2291,143 @@ TEST_CASE("Explore filter rollback quiesces candidate lanes before restoring com
     const auto restored_frame = restored.frame.revision;
     scenario.ReleaseAndWaitForFrameAfter(restored_frame);
     CHECK(explore.snapshot().order.visible_indices == committed.order.visible_indices);
+}
+
+TEST_CASE("Explore prepared-product failure restores exact borrows or retires failed rollback") {
+    const bool rollback_fails = GENERATE(false, true);
+    StreamingExploreFixture scenario{2U};
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {8U, 4U}, .row_count = 1U, .columns = 2U});
+    scenario.probe().AllowAllocation();
+    REQUIRE(scenario.probe().Wait([&] { return scenario.probe().assignments.size() == 2U; }));
+    const auto incumbent = explore.snapshot();
+    auto borrowed = rollback_fails ? mmltk::frameworks::gpu::BorrowedImageProductReadView{} : explore.BorrowFrame();
+    if (!rollback_fails) REQUIRE(borrowed.valid());
+    {
+        std::scoped_lock lock(scenario.probe().mutex);
+        scenario.probe().fail_next_labels = true;
+        scenario.probe().fail_rollback = rollback_fails;
+    }
+    explore.UpdateViewport({.viewport = {.extent = {8U, 4U}, .first_row = 1U, .row_count = 1U, .columns = 2U}});
+    REQUIRE(scenario.Wait([&] { return scenario.failure_count() == 1U; }));
+    const auto failed = explore.snapshot();
+    CHECK_FALSE(failed.failure.empty());
+    {
+        std::scoped_lock lock(scenario.probe().mutex);
+        CHECK(scenario.probe().rollbacks == 1U);
+    }
+    if (rollback_fails) {
+        CHECK_FALSE(failed.ready);
+        CHECK_FALSE(explore.BorrowFrame().valid());
+        CHECK(scenario.backend().streams_destroyed == 1U);
+    } else {
+        CHECK(failed.frame == incumbent.frame);
+        CHECK(failed.gallery.generation == incumbent.gallery.generation);
+        CHECK(failed.gallery.slots == incumbent.gallery.slots);
+        CHECK(failed.viewport == incumbent.viewport);
+        CHECK(failed.order.visible_indices == incumbent.order.visible_indices);
+        CHECK(borrowed.plane(0U).revision() == incumbent.frame.revision);
+        borrowed = {};
+        scenario.ReleaseAndWaitForFrameAfter(incumbent.frame.revision);
+    }
+}
+
+TEST_CASE("Explore Stop abandons unfinished thumbnails while retaining completed product meaning") {
+    StreamingExploreFixture scenario{2U};
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {8U, 4U}, .row_count = 1U, .columns = 2U});
+    scenario.probe().AllowAllocation();
+    REQUIRE(scenario.probe().Wait([&] { return scenario.probe().assignments.size() == 2U; }));
+    const auto incumbent = explore.snapshot();
+    static_cast<void>(explore.Stop());
+    scenario.probe().ReleaseAll();
+    explore.Shutdown();
+    const auto stopped = explore.snapshot();
+    CHECK(stopped.frame == incumbent.frame);
+    CHECK(stopped.gallery.generation == incumbent.gallery.generation);
+    CHECK(stopped.gallery.slots == incumbent.gallery.slots);
+    CHECK(stopped.order.visible_indices == incumbent.order.visible_indices);
+    CHECK(scenario.failure_count() == 0U);
+}
+
+TEST_CASE("Explore failed staged runtime construction resumes the incumbent unfinished gallery") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto probe = std::make_shared<StreamingExploreProbe>();
+    auto replacement_probe = std::make_shared<StreamingExploreProbe>();
+    auto attempts = std::make_shared<std::atomic_uint32_t>(0U);
+    LoadedSettings settings;
+    const auto initial_h2d = settings.system().explore_settings_candidate().loading.h2d_dataloader;
+    const auto select_transport = [&](const bool h2d) {
+        contracts::SettingsUpdateRequest update;
+        update.updates.push_back({.path = "workflows.explore.h2d_dataloader",
+                                  .value = mmltk::frameworks::serialization::wire::FlatValue{h2d}});
+        static_cast<void>(settings.system().Update(std::move(update)));
+    };
+    auto incumbent_factory = streaming_explore_runtime_factory(backend, probe);
+    auto replacement_factory = streaming_explore_runtime_factory(backend, replacement_probe);
+    std::promise<ExploreSnapshot> failed;
+    auto failure = failed.get_future();
+    ExploreSystem* active = nullptr;
+    std::atomic_bool exact_incumbent_borrow = false;
+    ExploreScenario scenario{
+        settings, 2U,
+        [attempts, incumbent_factory, replacement_factory](auto revisions) {
+            if (attempts->fetch_add(1U) == 0U) return incumbent_factory(std::move(revisions));
+            // Construct real replacement execution resources, then reject before
+            // the staged owner can replace the still-live incumbent runtime.
+            auto rejected = replacement_factory(std::move(revisions));
+            throw std::runtime_error("deterministic staged Explore construction failure");
+        },
+        [&](ExploreSystem::event_type event) {
+            if (const auto* value = std::get_if<ExploreFailed>(&event)) {
+                exact_incumbent_borrow = visual_product_matches_frame(value->snapshot.frame, active->BorrowFrame());
+                // Remove the rejected execution request before the next normal
+                // completion rechecks settings. No new Explore demand is sent.
+                select_transport(initial_h2d);
+                failed.set_value(value->snapshot);
+                probe->ReleaseAll();
+            }
+        }};
+    auto& explore = scenario.system();
+    active = &explore;
+    scenario.OpenAndWait({.extent = {8U, 4U}, .row_count = 1U, .columns = 2U}, "/incumbent");
+    probe->AllowAllocation();
+    REQUIRE(probe->Wait([&] { return probe->assignments.size() == 2U; }));
+    const auto incumbent = explore.snapshot();
+    auto held = explore.BorrowFrame();
+    REQUIRE(held.valid());
+    select_transport(!initial_h2d);
+    static_cast<void>(explore.Open({.viewport = {.extent = {8U, 4U}, .first_row = 1U, .row_count = 1U, .columns = 2U},
+                                   .compiled_source = "/rejected"}));
+    REQUIRE(failure.wait_for(2s) == std::future_status::ready);
+    const auto restored = failure.get();
+    CHECK(restored.ready);
+    CHECK_FALSE(restored.failure.empty());
+    CHECK(restored.dataset.identity == incumbent.dataset.identity);
+    CHECK(restored.order.visible_indices == incumbent.order.visible_indices);
+    CHECK(restored.viewport == incumbent.viewport);
+    CHECK(restored.gallery.generation == incumbent.gallery.generation);
+    CHECK(restored.gallery.slots == incumbent.gallery.slots);
+    CHECK(restored.frame == incumbent.frame);
+    CHECK(exact_incumbent_borrow.load());
+    CHECK(held.plane(0U).revision() == incumbent.frame.revision);
+    REQUIRE(scenario.Wait([&] { return explore.snapshot().frame.revision > incumbent.frame.revision; }));
+    CHECK(explore.snapshot().order.visible_indices == incumbent.order.visible_indices);
+    CHECK(explore.snapshot().viewport == incumbent.viewport);
+    CHECK(attempts->load() == 2U);
+    {
+        std::scoped_lock lock(probe->mutex);
+        CHECK(probe->quiescences == 0U);
+        CHECK(probe->opened_source == "/incumbent");
+        CHECK(probe->cumulative == incumbent.order.visible_indices.size());
+    }
+    {
+        std::scoped_lock lock(replacement_probe->mutex);
+        CHECK(replacement_probe->quiescences == 1U);
+        CHECK(replacement_probe->opened_source.empty());
+    }
+    held = {};
+    explore.Shutdown();
 }
 
 TEST_CASE("Explore render mutations abort queued lanes before failed cancelled and stale restoration") {
@@ -2353,6 +2505,11 @@ TEST_CASE("Explore render mutations abort queued lanes before failed cancelled a
             scenario.probe().render_gate.reset();
         }
         const auto restored_frame = restored.frame.revision;
+        if (rejection == Rejection::Cancelled) {
+            // Stop abandons the restored continuation. A subsequent explicit
+            // viewport demand resumes the same logical gallery.
+            explore.UpdateViewport({.viewport = restored.viewport});
+        }
         scenario.ReleaseAndWaitForFrameAfter(restored_frame);
         CHECK(explore.snapshot().order.visible_indices == committed.order.visible_indices);
         explore.Shutdown();
@@ -2825,7 +2982,7 @@ TEST_CASE("failed Explore catalog persistence restores the pending filter for or
     CHECK(explore.snapshot().order.visible_indices == committed.order.visible_indices);
     CHECK(explore.snapshot().filter == committed.filter);
     CHECK(explore.snapshot().overlay == committed.overlay);
-    CHECK(explore.snapshot().frame.revision > committed.frame.revision);
+    CHECK(explore.snapshot().frame == committed.frame);
     CHECK(explore.snapshot().revision > admitted.revision);
     CHECK(settings.system().snapshot().settings_state.workflows.explore.class_catalog_identity == prior.class_catalog_identity);
 
@@ -3119,11 +3276,12 @@ TEST_CASE("Explore successful persistence is settled before Stop can observe it"
     }));
     REQUIRE(persistence_entered->get_future().wait_for(2s) == std::future_status::ready);
     auto stopped = std::async(std::launch::async, [&explore] { return explore.Stop(); });
+    CHECK(stopped.wait_for(100ms) == std::future_status::timeout);
+    release_persistence->set_value();
     REQUIRE(stopped.wait_for(2s) == std::future_status::ready);
     const auto stopping = stopped.get();
-    CHECK(stopping.busy);
-    CHECK(stopping.cancellation_requested);
-    release_persistence->set_value();
+    CHECK_FALSE(stopping.busy);
+    CHECK_FALSE(stopping.cancellation_requested);
     REQUIRE(scenario.Wait([&] {
         const auto state = explore.snapshot();
         return !state.busy && !state.cancellation_requested && state.filter.minimum_instances == 1U;
@@ -3488,6 +3646,10 @@ TEST_CASE("Explore visibility preserves active augmentation and labels preserve 
     CHECK(semantic.frame.revision > before.frame.revision);
     CHECK(semantic.frame.clean_revision == before.frame.clean_revision);
     CHECK(probe->rendered_copy_paste_probability.load(std::memory_order_acquire) == original);
+    scenario.OpenAndWait(semantic.viewport);
+    const auto reopened = scenario.system().snapshot();
+    CHECK(reopened.dataset.identity == semantic.dataset.identity);
+    CHECK(reopened.frame.clean_revision > semantic.frame.clean_revision);
 }
 
 TEST_CASE("Explore discrete products use the viewport current at execution") {
@@ -3783,7 +3945,7 @@ TEST_CASE("Explore stop at filter finalization cancels before persistence") {
     CHECK(settled.filter == before.filter);
     CHECK(settled.overlay.show_boxes == before.overlay.show_boxes);
     CHECK(settled.overlay.show_masks == before.overlay.show_masks);
-    CHECK(settled.frame.revision > before.frame.revision);
+    CHECK(settled.frame == before.frame);
     CHECK(settings.system().snapshot().revision == settings_revision);
     REQUIRE(explore.BorrowFrame().valid());
     CHECK(explore.BorrowFrame().plane(0U).revision() == settled.frame.revision);

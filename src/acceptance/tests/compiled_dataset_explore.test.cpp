@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -1281,6 +1282,17 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
         CHECK(audit.augmentation_count() == augmentations);
         CHECK(batch.device_images == retained_training_images);
     }
+    const auto incumbent = system.snapshot();
+    const auto reused_before_reopen = audit.reused_tiles();
+    static_cast<void>(system.Open({.viewport = incumbent.viewport, .compiled_source = compiled.string()}));
+    REQUIRE(audit.Wait([&] {
+        const auto reopened = system.snapshot();
+        return !reopened.busy && reopened.frame != incumbent.frame && reopened.gallery.slots == std::vector<bool>(6U, true);
+    }));
+    CHECK(system.snapshot().dataset.identity == incumbent.dataset.identity);
+    CHECK(system.snapshot().frame.clean_revision > incumbent.frame.clean_revision);
+    CHECK(audit.reused_tiles() == reused_before_reopen);
+    CHECK(batch.device_images == retained_training_images);
     gate->Stop();
     system.Shutdown();
     CHECK(batch.device_images == retained_training_images);
@@ -1297,11 +1309,139 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
     training.synchronize();
 }
 
+void test_native_explore_transaction_faults_and_inactive_release() {
+    enum class Outcome { Commit, Descriptors, CompletedProduct, Cancel };
+    const auto outcome = GENERATE(Outcome::Commit, Outcome::Descriptors, Outcome::CompletedProduct, Outcome::Cancel);
+    require_explore_transport(true);
+    mmltk::testsupport::ScopedTempDir root{"mmltk-explore-native-transaction"};
+    const auto compiled = mmltk::testsupport::compile_explore_fixture(root.path(), "fixture", 4);
+    controller::SettingsSystem settings;
+    load_explore_transport(settings, root.path() / "gui.json", true);
+    std::array<int, 2U> sockets{-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()) == 0);
+    mmltk::common::io::ScopedFd commands{sockets[0]};
+    auto gate = std::make_shared<controller::ExploreAcceptanceGate>(sockets[1]);
+    struct Observation {
+        std::mutex mutex;
+        std::weak_ptr<const void> prepared, released;
+        std::size_t remaining = 0U, before = 0U, after = 0U;
+        std::atomic_bool block = false;
+        std::promise<void> entered, release;
+        std::shared_future<void> resumed = release.get_future().share();
+    } observation;
+    gate->SetProductObserver(&observation, [](void* context, controller::ExploreAcceptanceGate::ProductObservation fact) noexcept {
+        auto& observed = *static_cast<Observation*>(context);
+        {
+            std::scoped_lock lock(observed.mutex);
+            if (fact.released) {
+                observed.released = std::move(fact.artifact);
+                observed.remaining = fact.logical_size;
+                observed.before = fact.capacity_before;
+                observed.after = fact.capacity_after;
+            } else {
+                observed.prepared = std::move(fact.artifact);
+            }
+        }
+        if (!fact.released && observed.block.exchange(false)) {
+            observed.entered.set_value();
+            observed.resumed.wait();
+        }
+    });
+    NativeExploreAudit audit;
+    const controller::VisualDeviceSettings device{.device = 0, .maximum_width = 256U, .maximum_height = 256U};
+    controller::ExploreSystem system{
+        settings, device, 1U,
+        controller::make_native_explore_runtime_factory(
+            device, 1U, {.loading = data::data_loading_options(true), .acceptance = gate}),
+        [&audit](controller::ExploreSystem::event_type event) { audit.Observe(std::move(event)); }};
+    struct StopGate {
+        controller::ExploreAcceptanceGate& gate;
+        ~StopGate() { gate.Stop(); }
+    } stop{*gate};
+    const controller::ExploreViewport viewport{.extent = {64U, 32U}, .columns = 2U};
+    static_cast<void>(system.Open({.viewport = viewport, .compiled_source = compiled.string()}));
+    REQUIRE(audit.Wait([&] { return system.snapshot().ready && !system.snapshot().busy; }));
+    const auto incumbent = system.snapshot();
+    // Wake any automatic continuation already waiting for an acceptance command.
+    // Terminal reads stay stale, preserving the incumbent placeholders while
+    // replacement quiescence reaches the publication controls in every variant.
+    gate->Stop();
+    std::weak_ptr<const void> incumbent_artifact;
+    {
+        std::scoped_lock lock(observation.mutex);
+        incumbent_artifact = observation.prepared;
+    }
+    REQUIRE_FALSE(incumbent_artifact.expired());
+    auto held = system.BorrowFrame();
+    REQUIRE(controller::visual_product_matches_frame(incumbent.frame, held));
+    namespace gpu = mmltk::frameworks::gpu;
+    const auto backend = gpu::cuda_image_copy_backend();
+    gpu::DeviceContext receiver_context{0, backend};
+    gpu::ImageStream receiver_stream{receiver_context};
+    gpu::ImageProductBuffer receiver{receiver_context, gpu::ImageProductLayout::CleanAndSemantic};
+    const auto pixels = [&] {
+        static_cast<void>(receiver.CopyFrom(receiver_stream, system.BorrowFrame()));
+        const auto read = receiver.Borrow();
+        receiver_context.Bind();
+        CUcontext context = nullptr;
+        REQUIRE(cuCtxGetCurrent(&context) == CUDA_SUCCESS);
+        std::array<std::vector<std::uint8_t>, 2U> result;
+        for (std::size_t index = 0U; index != result.size(); ++index) {
+            const auto plane = read.plane(index).plane();
+            result[index].resize(viewport.extent.width * viewport.extent.height * 4U);
+            backend->CopyDeviceToHost(reinterpret_cast<std::uintptr_t>(context), plane, result[index].data(), viewport.extent.width * 4U);
+        }
+        return result;
+    };
+    const auto incumbent_pixels = pixels();
+    using Stage = controller::ExploreAcceptanceGate::PublicationStage;
+    if (outcome == Outcome::Descriptors) gate->FailNextPublicationAt(Stage::DescriptorsPrepared);
+    if (outcome == Outcome::CompletedProduct) gate->FailNextPublicationAt(Stage::ProductPrepared);
+    if (outcome == Outcome::Cancel) observation.block = true;
+    const auto admitted = system.Open({.viewport = viewport, .compiled_source = compiled.string()});
+    if (outcome == Outcome::Cancel) {
+        const auto entered = observation.entered.get_future().wait_for(std::chrono::seconds{2});
+        // Always release the worker before an assertion can unwind its owner.
+        if (entered == std::future_status::ready) static_cast<void>(system.Stop());
+        observation.release.set_value();
+        REQUIRE(entered == std::future_status::ready);
+    }
+    REQUIRE(audit.Wait([&] { return !system.snapshot().busy && system.snapshot().revision > admitted.revision; }));
+    const auto settled = system.snapshot();
+    {
+        std::scoped_lock lock(observation.mutex);
+        CHECK(observation.released.expired());
+        CHECK(observation.remaining == 0U);
+        CHECK(observation.before != 0U);
+        CHECK(observation.after == observation.before);
+        CHECK(observation.prepared.expired() == (outcome != Outcome::Commit));
+    }
+    CHECK(held.plane(0U).revision() == incumbent.frame.revision);
+    if (outcome == Outcome::Commit) {
+        CHECK(incumbent_artifact.expired());
+        CHECK(settled.frame != incumbent.frame);
+    } else {
+        CHECK_FALSE(incumbent_artifact.expired());
+        CHECK(settled.frame == incumbent.frame);
+        CHECK(settled.dataset.identity == incumbent.dataset.identity);
+        CHECK(settled.order.visible_indices == incumbent.order.visible_indices);
+        CHECK(settled.viewport == incumbent.viewport);
+        CHECK(settled.gallery.generation == incumbent.gallery.generation);
+        CHECK(settled.gallery.slots == incumbent.gallery.slots);
+        CHECK(pixels() == incumbent_pixels);
+        CHECK(settled.failure.empty() == (outcome == Outcome::Cancel));
+    }
+    held = {};
+    gate->Stop();
+    system.Shutdown();
+}
+
 }  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[acceptance][backend-data][explore]", test_compiled_dataset_explore_projection_navigation_and_streaming);
 MMLTK_REGISTER_TEST_CASE("[acceptance][backend-data][explore][capacity]", test_compiled_explore_optional_donors_respect_source_capacity);
 MMLTK_REGISTER_TEST_CASE("[acceptance][backend-data][explore][completion]", test_compiled_explore_cancelled_lane_preserves_atomic_product);
+MMLTK_REGISTER_TEST_CASE("[acceptance][backend-data][explore][transaction]", test_native_explore_transaction_faults_and_inactive_release);
 
 MMLTK_REGISTER_TEST_CASE("[acceptance][backend-data][explore][support]", test_compiled_explore_magnified_tiny_mask_and_transfer);
 MMLTK_REGISTER_TEST_CASE("[acceptance][explore][copy_paste]", test_compiled_explore_ring_holes_survive_hidden_donor_and_transfer);
