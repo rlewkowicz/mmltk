@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
+#include "src/frameworks/gpu/image_failure.h"
 
 namespace mmltk::controller {
 
@@ -14,6 +15,8 @@ mmltk::frameworks::gpu::BorrowedImageProductReadView borrow_matching_visual_prod
 }  // namespace mmltk::controller
 
 namespace mmltk::controller::detail {
+
+using mmltk::frameworks::gpu::combine_image_failures;
 
 VisualRuntimeOwner::VisualRuntimeOwner(RuntimeFactory factory, FailureSink failures, ActivityObservation activity)
     : factory_(std::move(factory)),
@@ -129,7 +132,10 @@ bool VisualRuntimeOwner::RequestActiveStop() noexcept {
     Notification cancellation;
     {
         std::scoped_lock lock(mutex_);
-        stop = active_stop_;
+        if (active_outcome_ == ActiveOutcome::Running) {
+            active_outcome_ = ActiveOutcome::Cancelled;
+            stop = active_stop_;
+        }
         if (!active_discrete_) {
             const auto queued = std::ranges::find_if(ordered_, [](const auto& item) { return item.discrete; });
             if (queued != ordered_.end()) {
@@ -144,6 +150,12 @@ bool VisualRuntimeOwner::RequestActiveStop() noexcept {
     if (cancellation) cancellation();
     return cancelled_queued;
 }
+bool VisualRuntimeOwner::TryCompleteActiveWork() noexcept {
+    std::scoped_lock lock(mutex_);
+    if (!active_stop_.stop_possible() || active_outcome_ == ActiveOutcome::Cancelled) return false;
+    active_outcome_ = ActiveOutcome::Completed;
+    return true;
+}
 void VisualRuntimeOwner::RequestStop() noexcept {
     std::stop_source stop{std::nostopstate};
     {
@@ -156,7 +168,10 @@ void VisualRuntimeOwner::RequestStop() noexcept {
         runtime_retirement_blocked_ = true;
         discrete_active_ = false;
         terminal_barrier_active_ = false;
-        stop = active_stop_;
+        if (active_outcome_ == ActiveOutcome::Running) {
+            active_outcome_ = ActiveOutcome::Cancelled;
+            stop = active_stop_;
+        }
     }
     static_cast<void>(stop.request_stop());
     Observe(ActivityStage::StopRequested);
@@ -174,26 +189,59 @@ bool VisualRuntimeOwner::busy() const noexcept {
     return discrete_active_;
 }
 mmltk::frameworks::gpu::BorrowedImageProductReadView VisualRuntimeOwner::Borrow() const {
-    std::scoped_lock lock(mutex_);
-    Observe(ActivityStage::BorrowLocked);
-    auto current = runtime_ ? runtime_->Borrow() : mmltk::frameworks::gpu::BorrowedImageProductReadView{};
-    if (current.valid() || !replacement_fallback_) return current;
-    return replacement_fallback_->Borrow();
-}
-VisualRuntimeOwner::Runtime& VisualRuntimeOwner::RuntimeForWork() {
-    std::scoped_lock lock(mutex_);
-    if (!runtime_) {
-        runtime_ = factory_();
-        if (!runtime_) throw std::runtime_error("visual runtime factory returned no runtime");
-        runtime_->SetProductRevisionSequence(product_revision_sequence_);
+    bool observed = false;
+    for (;;) {
+        Runtime::CompletedOutput completed;
+        mmltk::frameworks::gpu::ImageProductPool::Availability available;
+        std::stop_token stop;
+        {
+            std::scoped_lock lock(mutex_);
+            if (!observed) Observe(ActivityStage::BorrowLocked);
+            observed = true;
+            if (!runtime_) return {};
+            available = runtime_->ObserveOutputAvailability();
+            completed = runtime_->Completed();
+            if (!completed.valid() && (stopping_ || !active_stop_.stop_possible())) return {};
+            stop = active_stop_.get_token();
+        }
+        if (completed.valid()) return completed.Borrow();
+        if (!available.Wait(stop)) return {};
     }
+}
+void VisualRuntimeOwner::NotifyReaders() const {
+    mmltk::frameworks::gpu::ImageProductPool::Availability available;
+    {
+        std::scoped_lock lock(mutex_);
+        if (runtime_) available = runtime_->ObserveOutputAvailability();
+    }
+    available.Notify();
+}
+VisualRuntimeOwner::Runtime* VisualRuntimeOwner::RuntimeForWork(std::stop_token worker_stop, std::stop_token operation_stop) {
+    const auto stopped = [&] { return worker_stop.stop_requested() || operation_stop.stop_requested(); };
+    if (stopped()) return nullptr;
+    auto& destination = replacement_active_ ? replacement_ : runtime_;
+    if (!destination) {
+        if (replacement_active_) RestorePolicy();
+        auto created = factory_(product_revision_sequence_);
+        if (!created) throw std::runtime_error("visual runtime factory returned no runtime");
+        {
+            std::scoped_lock lock(mutex_);
+            if (!stopping_ && !stopped()) destination = std::move(created);
+        }
+        if (created) {
+            if (auto failure = RetireOwned(std::move(created))) std::rethrow_exception(failure);
+            return nullptr;
+        }
+    }
+    if (stopped()) return nullptr;
     if (!execution_policy_) {
-        if (const auto* execution = runtime_->execution())
+        if (const auto* execution = destination->execution())
             execution_policy_.emplace(mmltk::common::system::ExecutionPolicyRequest{
                 execution->placement.cpus, {}, 0, execution->placement.numa_node, -10, false});
     }
-    runtime_->BeginWork();
-    return *runtime_;
+    if (stopped()) return nullptr;
+    destination->BeginWork();
+    return stopped() ? nullptr : destination.get();
 }
 void VisualRuntimeOwner::Observe(const ActivityStage stage, const std::uint64_t value) const noexcept {
     if (activity_) activity_(stage, value);
@@ -225,6 +273,7 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
             return;
         }
         active_stop_ = ordered_work ? ordered_work->stop : std::stop_source{};
+        active_outcome_ = ActiveOutcome::Running;
         active_discrete_ = discrete;
         operation_stop = active_stop_.get_token();
     }
@@ -234,14 +283,49 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
     } else if (worker_stop.stop_requested() || operation_stop.stop_requested()) {
         notification = {};
     } else if (ordered_work) {
-        if (ordered_work->reconstruct) BeginRuntimeReplacement();
-        notification = ordered_work->run(RuntimeForWork(), operation_stop);
-        if (ordered_work->reconstruct) CompleteRuntimeReplacement();
+        if (ordered_work->reconstruct) {
+            StagedReplacement replacement(*this);
+            try {
+                if (auto* runtime = RuntimeForWork(worker_stop, operation_stop);
+                    runtime && !worker_stop.stop_requested() && !operation_stop.stop_requested())
+                    notification = ordered_work->run(*runtime, operation_stop);
+                const bool completed = TryCompleteActiveWork();
+                const bool promote = completed && replacement_ && replacement_->Completed().valid();
+                if (!completed) notification = std::move(ordered_work->cancellation);
+                Observe(ActivityStage::StagedCompletionLatched, completed ? 1U : 0U);
+                if (auto failure = replacement.Finish(promote)) {
+                    ReportFailure(failure);
+                    return;
+                }
+            } catch (...) {
+                auto failure = std::current_exception();
+                if (auto custody = Runtime::UnsafeConstruction(failure)) {
+                    failure = custody->failure();
+                    std::scoped_lock lock(mutex_);
+                    retained_.emplace<Runtime::UnsafeCustody>(std::move(*custody));
+                }
+                failure = combine_image_failures(failure, replacement.Finish(false));
+                ReportFailure(failure);
+                return;
+            }
+        } else {
+            if (auto* runtime = RuntimeForWork(worker_stop, operation_stop);
+                runtime && !worker_stop.stop_requested() && !operation_stop.stop_requested())
+                notification = ordered_work->run(*runtime, operation_stop);
+            else
+                notification = std::move(ordered_work->cancellation);
+        }
     } else if (latest_work) {
-        notification = (*latest_work)(RuntimeForWork(), operation_stop);
+        if (auto* runtime = RuntimeForWork(worker_stop, operation_stop);
+            runtime && !worker_stop.stop_requested() && !operation_stop.stop_requested())
+            notification = (*latest_work)(*runtime, operation_stop);
     } else {
-        if (continuation_dispatched_) continuation_dispatched_();
-        notification = continuation_(RuntimeForWork(), operation_stop);
+        if (auto* runtime = RuntimeForWork(worker_stop, operation_stop);
+            runtime && !worker_stop.stop_requested() && !operation_stop.stop_requested()) {
+            if (continuation_dispatched_) continuation_dispatched_();
+            if (!worker_stop.stop_requested() && !operation_stop.stop_requested())
+                notification = continuation_(*runtime, operation_stop);
+        }
     }
     Observe(ActivityStage::WorkCompleted);
     bool wake_again = false;
@@ -257,6 +341,7 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
         wake_again =
             !ordered_.empty() || latest_.has_value() || (continuation_state_.load(std::memory_order_acquire) & kContinuationPending) != 0U;
     }
+    NotifyReaders();
     Observe(ActivityStage::CycleFinalized, wake_again ? 1U : 0U);
     if (notification) {
         Observe(ActivityStage::NotificationStarted);
@@ -272,156 +357,113 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
 }
 void VisualRuntimeOwner::Failed(const std::exception_ptr failure) noexcept {
     auto construction_custody = Runtime::UnsafeConstruction(failure);
-    const auto construction_failure = construction_custody ? construction_custody->failure() : std::exception_ptr{};
-    std::unique_ptr<Runtime> retired;
-    {
-        std::scoped_lock lock(mutex_);
-        if (preserve_runtime_on_failure_)
-            preserve_runtime_on_failure_ = false;
-        else
-            retired = std::move(runtime_);
-        if (replacement_fallback_) runtime_ = std::move(replacement_fallback_);
-        ordered_.clear();
-        latest_.reset();
-        continuation_state_.store(0U, std::memory_order_release);
-        runtime_retirement_blocked_ = true;
-        discrete_active_ = false;
-        terminal_barrier_active_ = false;
-        active_stop_ = std::stop_source{std::nostopstate};
-        active_discrete_ = false;
-    }
-    std::exception_ptr retirement_failure;
-    Runtime::UnsafeCustody retirement_custody;
-    bool unsafe_retirement = false;
-    if (retired) {
-        auto retirement = retired->Retire();
-        retirement_failure = retirement.failure;
-        unsafe_retirement = !retirement.safe_to_destroy;
-        if (unsafe_retirement) retirement_custody = std::move(retirement.custody);
-        retired.reset();
-    }
-    if (execution_policy_) {
-        try {
-            execution_policy_->Restore();
-            execution_policy_.reset();
-        } catch (...) { retirement_failure = std::current_exception(); }
-    }
-    {
-        std::scoped_lock lock(mutex_);
-        if (construction_custody)
-            retained_.emplace<Runtime::UnsafeCustody>(std::move(*construction_custody));
-        else if (unsafe_retirement)
-            retained_.emplace<Runtime::UnsafeCustody>(std::move(retirement_custody));
-        continuation_state_.store(0U, std::memory_order_release);
-        runtime_retirement_blocked_ = retained_.index() != 0U || execution_policy_.has_value();
-        if (continuation_ && !runtime_retirement_blocked_ && !stopping_)
-            continuation_state_.store(kContinuationEnabled, std::memory_order_release);
-    }
-    if (!failures_) return;
-    try {
-        failures_(retirement_failure ? retirement_failure : (construction_failure ? construction_failure : failure));
-    } catch (...) { failures_ = {}; }
-}
-
-void VisualRuntimeOwner::BeginRuntimeReplacement() {
-    {
-        std::scoped_lock lock(mutex_);
-        if (replacement_fallback_) throw std::logic_error("visual runtime replacement is already active");
-        replacement_fallback_ = std::move(runtime_);
-    }
-    if (execution_policy_) {
-        execution_policy_->Restore();
-        execution_policy_.reset();
-    }
-}
-
-void VisualRuntimeOwner::CompleteRuntimeReplacement() {
-    Runtime* replacement = nullptr;
-    {
-        std::scoped_lock lock(mutex_);
-        if (!replacement_fallback_) return;
-        replacement = runtime_.get();
-    }
-    auto completed = replacement ? replacement->Borrow() : mmltk::frameworks::gpu::BorrowedImageProductReadView{};
-    if (!completed.valid()) {
-        std::unique_ptr<Runtime> rejected;
-        {
-            std::scoped_lock lock(mutex_);
-            rejected = std::move(runtime_);
-            runtime_ = std::move(replacement_fallback_);
-            preserve_runtime_on_failure_ = true;
-        }
-        Observe(ActivityStage::RetirementStarted);
-        auto retirement = rejected->Retire();
-        rejected.reset();
-        if (!retirement.safe_to_destroy) {
-            std::scoped_lock lock(mutex_);
-            retained_.emplace<Runtime::UnsafeCustody>(std::move(retirement.custody));
-            runtime_retirement_blocked_ = true;
-        }
-        if (execution_policy_) {
-            execution_policy_->Restore();
-            execution_policy_.reset();
-        }
-        Observe(ActivityStage::RetirementCompleted, retirement.safe_to_destroy ? 1U : 0U);
-        if (retirement.failure) std::rethrow_exception(retirement.failure);
-        {
-            std::scoped_lock lock(mutex_);
-            preserve_runtime_on_failure_ = false;
-        }
-        return;
-    }
-
-    std::unique_ptr<Runtime> retired;
-    {
-        std::scoped_lock lock(mutex_);
-        retired = std::move(replacement_fallback_);
-    }
-    Observe(ActivityStage::RetirementStarted);
-    auto retirement = retired->Retire();
-    retired.reset();
-    if (!retirement.safe_to_destroy) {
-        std::scoped_lock lock(mutex_);
-        retained_.emplace<Runtime::UnsafeCustody>(std::move(retirement.custody));
-        runtime_retirement_blocked_ = true;
-    }
-    Observe(ActivityStage::RetirementCompleted, retirement.safe_to_destroy ? 1U : 0U);
-    if (retirement.failure) {
-        {
-            std::scoped_lock lock(mutex_);
-            preserve_runtime_on_failure_ = true;
-        }
-        std::rethrow_exception(retirement.failure);
-    }
-}
-
-void VisualRuntimeOwner::RetireRuntime() {
-    Observe(ActivityStage::RetirementStarted);
+    auto reported = construction_custody ? construction_custody->failure() : failure;
     std::unique_ptr<Runtime> retired;
     {
         std::scoped_lock lock(mutex_);
         retired = std::move(runtime_);
-    }
-    if (!retired) {
-        if (execution_policy_) {
-            execution_policy_->Restore();
-            execution_policy_.reset();
-        }
-        return;
-    }
-    auto retirement = retired->Retire();
-    retired.reset();
-    if (!retirement.safe_to_destroy) {
-        std::scoped_lock lock(mutex_);
-        retained_.emplace<Runtime::UnsafeCustody>(std::move(retirement.custody));
+        if (construction_custody) retained_.emplace<Runtime::UnsafeCustody>(std::move(*construction_custody));
         runtime_retirement_blocked_ = true;
     }
+    reported = combine_image_failures(reported, RetireOwned(std::move(retired)));
+    ReportFailure(reported);
+}
+
+void VisualRuntimeOwner::ReportFailure(std::exception_ptr failure) noexcept {
+    {
+        std::scoped_lock lock(mutex_);
+        ordered_.clear();
+        latest_.reset();
+        continuation_state_.store(0U, std::memory_order_release);
+        discrete_active_ = false;
+        terminal_barrier_active_ = false;
+        active_stop_ = std::stop_source{std::nostopstate};
+        active_discrete_ = false;
+        runtime_retirement_blocked_ = stopping_ || retained_.index() != 0U || execution_policy_.has_value();
+        if (continuation_ && !runtime_retirement_blocked_)
+            continuation_state_.store(kContinuationEnabled, std::memory_order_release);
+    }
+    NotifyReaders();
+    if (!failures_) return;
+    try {
+        failures_(failure);
+    } catch (...) { failures_ = {}; }
+}
+
+void VisualRuntimeOwner::RestorePolicy() {
     if (execution_policy_) {
         execution_policy_->Restore();
         execution_policy_.reset();
     }
-    Observe(ActivityStage::RetirementCompleted, retirement.safe_to_destroy ? 1U : 0U);
-    if (retirement.failure) std::rethrow_exception(retirement.failure);
+}
+
+std::exception_ptr VisualRuntimeOwner::RetireOwned(std::unique_ptr<Runtime> retired) noexcept {
+    Observe(ActivityStage::RetirementStarted);
+    std::exception_ptr failure;
+    bool safe = true;
+    if (retired) {
+        auto retirement = retired->Retire();
+        failure = retirement.failure;
+        safe = retirement.safe_to_destroy;
+        if (!safe) {
+            std::scoped_lock lock(mutex_);
+            retained_.emplace<Runtime::UnsafeCustody>(std::move(retirement.custody));
+        }
+        retired.reset();
+    }
+    try {
+        RestorePolicy();
+    } catch (...) { failure = combine_image_failures(failure, std::current_exception()); }
+    {
+        std::scoped_lock lock(mutex_);
+        runtime_retirement_blocked_ = stopping_ || retained_.index() != 0U || execution_policy_.has_value();
+    }
+    Observe(ActivityStage::RetirementCompleted, safe ? 1U : 0U);
+    return failure;
+}
+
+VisualRuntimeOwner::StagedReplacement::StagedReplacement(VisualRuntimeOwner& owner) : owner_(&owner) {
+    if (owner.replacement_active_) throw std::logic_error("visual runtime replacement is already active");
+    owner.replacement_active_ = true;
+}
+VisualRuntimeOwner::StagedReplacement::~StagedReplacement() {
+    if (owner_) {
+        auto* owner = owner_;
+        if (auto failure = Finish(false)) owner->ReportFailure(failure);
+    }
+}
+std::exception_ptr VisualRuntimeOwner::StagedReplacement::Finish(bool promote) noexcept {
+    if (!owner_) return {};
+    return std::exchange(owner_, nullptr)->FinishRuntimeReplacement(promote);
+}
+std::exception_ptr VisualRuntimeOwner::FinishRuntimeReplacement(bool promote) noexcept {
+    std::unique_ptr<Runtime> retired;
+    {
+        std::scoped_lock lock(mutex_);
+        if (promote) {
+            retired = std::move(runtime_);
+            runtime_ = std::move(replacement_);
+        } else {
+            retired = std::move(replacement_);
+        }
+        replacement_active_ = false;
+    }
+    return RetireOwned(std::move(retired));
+}
+void VisualRuntimeOwner::RetireRuntime() {
+    std::unique_ptr<Runtime> retired;
+    std::unique_ptr<Runtime> replacement;
+    {
+        std::scoped_lock lock(mutex_);
+        retired = std::move(runtime_);
+        replacement = std::move(replacement_);
+        replacement_active_ = false;
+        runtime_retirement_blocked_ = true;
+    }
+    std::exception_ptr failure;
+    if (replacement) failure = RetireOwned(std::move(replacement));
+    failure = combine_image_failures(failure, RetireOwned(std::move(retired)));
+    if (failure) std::rethrow_exception(failure);
 }
 
 }  // namespace mmltk::controller::detail

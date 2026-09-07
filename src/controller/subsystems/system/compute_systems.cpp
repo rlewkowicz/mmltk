@@ -1,6 +1,6 @@
 #include "src/backend/data/compiled_dataset.h"
 #include "src/controller/subsystems/system/compute_systems.h"
-#include "src/frameworks/gpu/system_image_worker.h"
+#include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/controller/presentation/detail/visual_runtime_owner.h"
 #include "src/controller/presentation/visual_diagnostics.h"
 #include "src/common/system/execution_policy.h"
@@ -449,7 +449,7 @@ class PredictSystem::Impl final {
           events_(std::move(events)),
           worker_(
               [visual, topology = mmltk::common::system::NumaTopology::Capture(),
-               execution = std::optional<mmltk::frameworks::gpu::DeviceExecution>{}, factory = std::move(factory)]() mutable {
+               execution = std::optional<mmltk::frameworks::gpu::DeviceExecution>{}, factory = std::move(factory)](auto revisions) mutable {
                   if (!execution) execution = mmltk::frameworks::gpu::resolve_device_execution(visual.device, topology, visual.numa_node);
                   return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
                       .device = visual.device,
@@ -457,6 +457,7 @@ class PredictSystem::Impl final {
                       .output_layout = mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
                       .numa_node = visual.numa_node,
                       .execution = *execution,
+                      .product_revisions = std::move(revisions),
                   });
               },
               [this](const std::exception_ptr failure) { Failed(failure); }) {
@@ -509,7 +510,7 @@ class PredictSystem::Impl final {
                         }
                         const auto frame =
                             product.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded
-                                ? visual_frame({PresentationSourceKind::Predict, 1U}, product.extent, runtime.output().revision())
+                                ? visual_frame({PresentationSourceKind::Predict, 1U}, product.extent, runtime.OutputFacts().revision)
                                 : VisualFrame{};
                         return [this, terminal = std::move(product.terminal), frame]() mutable { Settled(std::move(terminal), frame); };
                     },

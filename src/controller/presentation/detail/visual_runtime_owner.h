@@ -10,6 +10,8 @@
 #include <stop_token>
 #include <variant>
 
+#include "src/frameworks/gpu/system_image_runtime.h"
+#include "src/frameworks/gpu/product_revision_sequence.h"
 #include "src/frameworks/gpu/system_image_worker.h"
 #include "src/common/system/execution_policy.h"
 #include "src/controller/presentation/visual_runtime.h"
@@ -35,6 +37,7 @@ class VisualRuntimeOwner final {
         JoinCompleted,
         RetirementStarted,
         RetirementCompleted,
+        StagedCompletionLatched,
     };
     using Runtime = mmltk::frameworks::gpu::SystemImageRuntime;
     using RuntimeFactory = VisualRuntimeFactory;
@@ -43,6 +46,11 @@ class VisualRuntimeOwner final {
     using Work = std::move_only_function<Notification(Runtime&, std::stop_token)>;
     using FailureSink = std::function<void(std::exception_ptr)>;
     using ActivityObservation = std::move_only_function<void(ActivityStage, std::uint64_t) const noexcept>;
+
+    // Claim the active operation's terminal boundary before committing producer
+    // state. A winning stop rejects completion; a winning completion makes later
+    // stops inert for this operation. Staged work also claims it on return.
+    [[nodiscard]] bool TryCompleteActiveWork() noexcept;
 
     VisualRuntimeOwner(RuntimeFactory, FailureSink, ActivityObservation = {});
     ~VisualRuntimeOwner();
@@ -72,14 +80,27 @@ class VisualRuntimeOwner final {
         bool reconstruct = false;
     };
     using RetainedRuntime = std::variant<std::monostate, Runtime::UnsafeCustody>;
+    class StagedReplacement final {
+       public:
+        explicit StagedReplacement(VisualRuntimeOwner&);
+        ~StagedReplacement();
+        StagedReplacement(const StagedReplacement&) = delete;
+        StagedReplacement& operator=(const StagedReplacement&) = delete;
+        [[nodiscard]] std::exception_ptr Finish(bool promote) noexcept;
+       private:
+        VisualRuntimeOwner* owner_;
+    };
     void Run(std::stop_token);
     void Failed(std::exception_ptr) noexcept;
-    void BeginRuntimeReplacement();
-    void CompleteRuntimeReplacement();
+    void ReportFailure(std::exception_ptr) noexcept;
+    [[nodiscard]] std::exception_ptr FinishRuntimeReplacement(bool) noexcept;
+    [[nodiscard]] std::exception_ptr RetireOwned(std::unique_ptr<Runtime>) noexcept;
+    void RestorePolicy();
+    void NotifyReaders() const;
     void RetireRuntime();
     void FlushLatest();
     void Observe(ActivityStage, std::uint64_t value = 0U) const noexcept;
-    [[nodiscard]] Runtime& RuntimeForWork();
+    [[nodiscard]] Runtime* RuntimeForWork(std::stop_token worker_stop, std::stop_token operation_stop);
 
     RuntimeFactory factory_;
     FailureSink failures_;
@@ -93,17 +114,19 @@ class VisualRuntimeOwner final {
     static constexpr std::uint8_t kContinuationPending = 2U;
     std::atomic<std::uint8_t> continuation_state_{0U};
     std::unique_ptr<Runtime> runtime_;
-    std::unique_ptr<Runtime> replacement_fallback_;
-    std::shared_ptr<std::atomic<std::uint64_t>> product_revision_sequence_{
-        std::make_shared<std::atomic<std::uint64_t>>(1U)};
+    std::unique_ptr<Runtime> replacement_;
+    bool replacement_active_ = false;
+    const std::shared_ptr<mmltk::frameworks::gpu::ImageProductRevisionSequence> product_revision_sequence_{
+        std::make_shared<mmltk::frameworks::gpu::ImageProductRevisionSequence>()};
     std::optional<mmltk::common::system::ScopedExecutionPolicy> execution_policy_;
     RetainedRuntime retained_;
     std::stop_source active_stop_{std::nostopstate};
+    enum class ActiveOutcome : std::uint8_t { Running, Cancelled, Completed };
+    ActiveOutcome active_outcome_ = ActiveOutcome::Running;
     bool discrete_active_ = false;
     bool active_discrete_ = false;
     bool terminal_barrier_active_ = false;
     bool runtime_retirement_blocked_ = false;
-    bool preserve_runtime_on_failure_ = false;
     bool stopping_ = false;
     mmltk::frameworks::gpu::SystemImageWorker worker_;
 };

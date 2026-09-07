@@ -1,7 +1,7 @@
 #include "src/backend/data/compiled_image_stream.h"
 #include "src/backend/data/compiled_dataset.h"
 #include "src/controller/subsystems/explore/explore_system.h"
-#include "src/frameworks/gpu/system_image_worker.h"
+#include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/controller/subsystems/explore/native_explore_storage.h"
 #include "src/backend/imaging/explore/explore_render_storage.h"
 
@@ -2714,7 +2714,7 @@ VisualRuntimeFactory make_native_explore_runtime_factory(const VisualDeviceSetti
                                (settings.numa_node >= 0 && resolved_execution->placement.numa_node != settings.numa_node)))
         throw contracts::InvalidIntentError("Explore resolved placement contradicts selected device settings");
     return [settings, nproc, execution = resolved_execution ? std::move(*resolved_execution) : resolve_visual_device_execution(settings),
-            configuration = std::move(configuration)] {
+            configuration = std::move(configuration)](auto revisions) {
         mmltk::common::system::ScopedExecutionPolicy construction(
             {execution.placement.cpus, {}, 0, execution.placement.numa_node, -10, false});
         return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
@@ -2724,6 +2724,7 @@ VisualRuntimeFactory make_native_explore_runtime_factory(const VisualDeviceSetti
             .output_buffer_count = 2U,
             .numa_node = settings.numa_node,
             .execution = execution,
+            .product_revisions = std::move(revisions),
         });
     };
 }

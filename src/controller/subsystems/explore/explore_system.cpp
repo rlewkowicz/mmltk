@@ -1,6 +1,7 @@
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/controller/presentation/detail/visual_runtime_owner.h"
-#include "src/frameworks/gpu/system_image_worker.h"
+#include "src/frameworks/gpu/system_image_runtime.h"
+#include "src/frameworks/gpu/image_failure.h"
 
 #include <algorithm>
 #include <exception>
@@ -87,21 +88,29 @@ class GalleryWakeGate final {
     explicit GalleryWakeGate(std::function<void()> wake) : wake_(std::move(wake)) {}
 
     void Invoke() noexcept {
-        std::scoped_lock lock(mutex_);
-        if (!wake_) return;
+        auto users = users_.load(std::memory_order_acquire);
+        do {
+            if ((users & kDisconnected) != 0U) return;
+        } while (!users_.compare_exchange_weak(users, users + 1U, std::memory_order_acq_rel, std::memory_order_acquire));
         try {
             wake_();
         } catch (...) {}
+        users_.fetch_sub(1U, std::memory_order_acq_rel);
+        users_.notify_all();
     }
 
     void Disconnect() noexcept {
-        std::scoped_lock lock(mutex_);
-        wake_ = {};
+        auto users = users_.fetch_or(kDisconnected, std::memory_order_acq_rel) | kDisconnected;
+        while (users != kDisconnected) {
+            users_.wait(users, std::memory_order_acquire);
+            users = users_.load(std::memory_order_acquire);
+        }
     }
 
    private:
-    std::mutex mutex_;
-    std::function<void()> wake_;
+    static constexpr std::uint64_t kDisconnected = std::uint64_t{1U} << 63U;
+    std::atomic<std::uint64_t> users_{0U};
+    const std::function<void()> wake_;
 };
 
 }  // namespace
@@ -280,6 +289,10 @@ class ExploreSystem::Impl final {
                             throw contracts::BusyError("Explore settings candidate is stale");
                         }
                         auto runtime_settings = settings_candidate;
+                        if (!worker_.TryCompleteActiveWork()) {
+                            open_finalization_lock.unlock();
+                            return cancel_open();
+                        }
                         std::scoped_lock finalization_lock(mutex_);
                         runtime.CommitOutput(std::move(rendered->output));
                         algorithm.CommitOutputPublication();
@@ -294,9 +307,8 @@ class ExploreSystem::Impl final {
                         augmentation_config_ = plan.augmentation_config;
                         state_ = std::move(settled);
                         return notification;
-                    } catch (const mmltk::frameworks::gpu::ImageStreamExecutionFailure&) {
-                        throw;
                     } catch (...) {
+                        if (mmltk::frameworks::gpu::is_image_execution_failure(std::current_exception())) throw;
                         if (!had_committed_product) {
                             RollbackOutput(algorithm);
                             algorithm.DiscardCandidate();
@@ -688,9 +700,8 @@ class ExploreSystem::Impl final {
                     desired_settings_.reset();
                     desired_persist_ = false;
                     return ChangedNotification(state_);
-                } catch (const mmltk::frameworks::gpu::ImageStreamExecutionFailure&) {
-                    throw;
                 } catch (...) {
+                    if (mmltk::frameworks::gpu::is_image_execution_failure(std::current_exception())) throw;
                     const auto detail = visual_failure_detail(std::current_exception(), "Explore render mutation failed");
                     std::unique_lock transaction(desired_admission_mutex_);
                     bool superseded = false;
@@ -773,9 +784,8 @@ class ExploreSystem::Impl final {
                     state_ = std::move(settled);
                 }
                 return notification;
-            } catch (const mmltk::frameworks::gpu::ImageStreamExecutionFailure&) {
-                throw;
             } catch (...) {
+                if (mmltk::frameworks::gpu::is_image_execution_failure(std::current_exception())) throw;
                 return RollbackCandidateFailure(algorithm, std::current_exception(), failure_fallback);
             }
         });
@@ -840,14 +850,13 @@ class ExploreSystem::Impl final {
             preserve_gallery_clean = has_committed_physical_product && same_gallery_clean &&
                                      (candidate == nullptr || candidate_visible == state_.order.visible_indices);
         }
-        auto output = runtime.AcquireOutput(stop);
+        auto output = runtime.AcquireOutput(stop, runtime.Completed());
         if (!output.valid()) {
             RollbackOutput(algorithm);
             return std::nullopt;
         }
         try {
             runtime.Publish(output, product_extent.width, product_extent.height,
-                            mmltk::frameworks::gpu::ImageCandidateInitialization::PreserveSelected,
                             [&](const auto clean, const auto semantic, const auto stream) {
                                 if (plan.mode == ExploreMode::Gallery)
                                     publication = algorithm.BeginGallery(plan, candidate, nproc, clean, semantic, stream);
@@ -999,14 +1008,13 @@ class ExploreSystem::Impl final {
                      .value = advanced.cumulative_tiles,
                      .context = {
                          .capacity_width = extent.width, .capacity_height = extent.height, .staging_bytes = advanced.active_pinned_bytes}});
-                auto output = runtime.AcquireOutput(stop);
+                auto output = runtime.AcquireOutput(stop, runtime.Completed());
                 if (!output.valid()) {
                     RollbackOutput(algorithm);
                     return {};
                 }
                 try {
                     runtime.Publish(output, extent.width, extent.height,
-                                    mmltk::frameworks::gpu::ImageCandidateInitialization::PreserveSelected,
                                     [&](const auto clean, const auto semantic, const auto stream) {
                                         diagnostics_({.system = VisualSystemKind::Explore,
                                                       .operation = VisualDiagnosticOperation::TileBatchComposeStarted,
@@ -1058,9 +1066,8 @@ class ExploreSystem::Impl final {
                     DiagnoseFrame(frame, generation);
                     SubmitGalleryContinuation();
                     return notification;
-                } catch (const mmltk::frameworks::gpu::ImageStreamExecutionFailure&) {
-                    throw;
                 } catch (...) {
+                    if (mmltk::frameworks::gpu::is_image_execution_failure(std::current_exception())) throw;
                     return RestorePersistenceFailure(
                         algorithm,
                         visual_failure_detail(std::current_exception(), "Explore progressive publication failed"));
@@ -1313,11 +1320,8 @@ class ExploreSystem::Impl final {
     void Failed(const std::exception_ptr failure) noexcept {
         auto detail = visual_failure_detail(failure, "Explore GPU worker failed");
         ExploreFailureKind kind = ExploreFailureKind::Operation;
-        try {
-            if (failure) std::rethrow_exception(failure);
-        } catch (const mmltk::frameworks::gpu::GdrTransportUnavailable&) {
+        if (mmltk::frameworks::gpu::find_image_failure<mmltk::frameworks::gpu::GdrTransportUnavailable>(failure))
             kind = ExploreFailureKind::SelectedTransportUnavailable;
-        } catch (...) {}
         ExploreSnapshot retained;
         {
             std::scoped_lock lock(mutex_);

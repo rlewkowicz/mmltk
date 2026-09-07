@@ -6,16 +6,29 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 #include <functional>
+#include <utility>
 
 #include "src/frameworks/gpu/image_buffer.h"
-#include "src/frameworks/gpu/system_image_worker.h"
+#include "src/frameworks/gpu/image_failure.h"
+#include "src/frameworks/gpu/system_image_runtime.h"
 
 namespace mmltk::frameworks::gpu::test_support {
+
+inline bool ContainsImageFailure(const std::exception_ptr& failure, const std::exception_ptr& expected) {
+    if (failure == expected) return true;
+    try {
+        if (failure) std::rethrow_exception(failure);
+    } catch (const ImageFailure& aggregate) {
+        return ContainsImageFailure(aggregate.primary(), expected) || ContainsImageFailure(aggregate.secondary(), expected);
+    } catch (...) {}
+    return false;
+}
 
 inline void CopyImagePlane(const ImagePlaneView destination, const ImagePlaneView source) {
     for (std::uint32_t row = 0U; row != source.descriptor.height; ++row) {
@@ -58,15 +71,17 @@ class FakeImageBackend final : public ImageCopyBackend {
     bool defer_events = false;
     std::atomic_bool defer_same_device_copies{false};
 
-    void FailAfter(const FailurePoint point, const std::size_t successful_calls = 0U) noexcept {
+    void FailAfter(const FailurePoint point, const std::size_t successful_calls = 0U, std::exception_ptr failure = {}) noexcept {
         failure_point_ = point;
         successful_calls_before_failure_ = successful_calls;
         persistent_failure_ = false;
+        injected_failure_ = std::move(failure);
     }
     void FailPersistently(const FailurePoint point) noexcept {
         failure_point_ = point;
         successful_calls_before_failure_ = 0U;
         persistent_failure_ = true;
+        injected_failure_ = {};
     }
 
     void CompleteEvents() noexcept {
@@ -229,6 +244,7 @@ class FakeImageBackend final : public ImageCopyBackend {
             return;
         }
         if (!persistent_failure_) failure_point_ = FailurePoint::None;
+        if (injected_failure_) std::rethrow_exception(injected_failure_);
         throw std::runtime_error("injected image backend failure");
     }
 
@@ -251,12 +267,13 @@ class FakeImageBackend final : public ImageCopyBackend {
     FailurePoint failure_point_ = FailurePoint::None;
     std::size_t successful_calls_before_failure_ = 0U;
     bool persistent_failure_ = false;
+    std::exception_ptr injected_failure_;
 };
 
-[[nodiscard]] inline std::function<std::unique_ptr<SystemImageRuntime>()> RuntimeFactory(
+[[nodiscard]] inline std::function<std::unique_ptr<SystemImageRuntime>(std::shared_ptr<ImageProductRevisionSequence>)> RuntimeFactory(
     const int device, const std::shared_ptr<FakeImageBackend>& backend, const ImageProductLayout layout = ImageProductLayout::Clean,
     std::function<std::unique_ptr<SystemImageModel>()> model = {}, const std::size_t output_buffer_count = 1U) {
-    return [device, backend, layout, model = std::move(model), output_buffer_count] {
+    return [device, backend, layout, model = std::move(model), output_buffer_count](std::shared_ptr<ImageProductRevisionSequence> revisions) {
         return std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
             .device = device,
             .backend = backend,
@@ -264,6 +281,7 @@ class FakeImageBackend final : public ImageCopyBackend {
             .input_layout = layout,
             .output_layout = layout,
             .output_buffer_count = output_buffer_count,
+            .product_revisions = std::move(revisions),
         });
     };
 }

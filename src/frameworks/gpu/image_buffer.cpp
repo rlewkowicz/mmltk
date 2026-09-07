@@ -60,19 +60,9 @@ void CheckCuda(const char* operation, const CUresult result) {
     } catch (...) { return std::current_exception(); }
     return {};
 }
-void RequireSettlement(ImageCopyBackend::StreamSettlement settled) {
-    if (settled.failure) std::rethrow_exception(settled.failure);
-    if (!settled.completion_reached) throw std::runtime_error("image stream completion boundary was not established");
-}
-[[noreturn]] void ThrowExecutionFailure(const ImageCopyBackend::StreamSettlement& settled) {
-    if (settled.failure) {
-        try {
-            std::rethrow_exception(settled.failure);
-        } catch (const std::exception& failure) {
-            throw ImageStreamExecutionFailure(failure.what());
-        } catch (...) { throw ImageStreamExecutionFailure("image stream execution failed"); }
-    }
-    throw ImageStreamExecutionFailure("image stream completion boundary was not established");
+[[noreturn]] void ThrowExecutionFailure(const ImageCopyBackend::StreamSettlement& settled,
+                                      std::exception_ptr initiating = {}) {
+    throw ImageStreamExecutionFailure(combine_image_failures(std::move(initiating), settled.failure));
 }
 void LogCopyFailure(const DeviceContext& receiver, const char* boundary, const bool completion_reached) noexcept {
     const TransferTrace trace;
@@ -85,13 +75,14 @@ void LogCopyFailure(const DeviceContext& receiver, const char* boundary, const b
 }
 
 template <typename ReadView>
-bool RetainUnsettledRead(ImageStream& stream, ReadView& source, std::optional<ReadView>& retained) noexcept {
-    const bool completed = stream.Settle().completion_reached;
-    if (!completed) {
+ImageCopyBackend::StreamSettlement RetainUnsettledRead(ImageStream& stream, ReadView& source,
+                                                       std::optional<ReadView>& retained) noexcept {
+    const auto settled = stream.Settle();
+    if (!settled.completion_reached) {
         source.Quarantine();
         retained.emplace(std::move(source));
     }
-    return completed;
+    return settled;
 }
 [[nodiscard]] constexpr bool CompletionBoundaryReached(const CUresult result) noexcept {
     switch (result) {
@@ -330,17 +321,34 @@ ImageStream::ImageStream(DeviceContext context) : context_(std::move(context)) {
 ImageStream::~ImageStream() {
     if (stream_ != 0U) context_.state_->backend->DestroyStream(context_.state_->context, stream_);
 }
-ImageStream::ImageStream(ImageStream&& other) noexcept : context_(std::move(other.context_)), stream_(std::exchange(other.stream_, 0U)) {}
+ImageStream::ImageStream(ImageStream&& other) noexcept
+    : context_(std::move(other.context_)), stream_(std::exchange(other.stream_, 0U)),
+      settlement_failure_(std::move(other.settlement_failure_)) {}
 ImageStream& ImageStream::operator=(ImageStream&& other) noexcept {
     if (this == &other) return *this;
     if (stream_ != 0U) context_.state_->backend->DestroyStream(context_.state_->context, stream_);
     context_ = std::move(other.context_);
     stream_ = std::exchange(other.stream_, 0U);
+    settlement_failure_ = std::move(other.settlement_failure_);
     return *this;
 }
-void ImageStream::Synchronize() { RequireSettlement(Settle()); }
+void ImageStream::Synchronize() {
+    const auto settled = Settle();
+    if (!settled.completion_reached || settled.failure) ThrowExecutionFailure(settled);
+}
 ImageCopyBackend::StreamSettlement ImageStream::Settle() noexcept {
-    return context_.state_->backend->SettleStream(context_.state_->context, stream_);
+    auto settled = context_.state_->backend->SettleStream(context_.state_->context, stream_);
+    if ((!settled.completion_reached || settled.failure) && !is_image_execution_failure(settled.failure)) {
+        try { throw ImageStreamExecutionFailure(settled.failure); }
+        catch (...) { settled.failure = std::current_exception(); }
+    }
+    settlement_failure_ = combine_image_failures(settlement_failure_, settled.failure);
+    return {.completion_reached = settled.completion_reached, .failure = settlement_failure_};
+}
+void ImageStream::RethrowAfterSettlement(std::exception_ptr submission) {
+    const auto settled = Settle();
+    if (!settled.completion_reached || settled.failure) ThrowExecutionFailure(settled, submission);
+    std::rethrow_exception(submission);
 }
 
 struct ImageBuffer::State final {
@@ -407,20 +415,19 @@ struct ImageBuffer::State final {
 struct BorrowedImageReadView::Lease final {
     explicit Lease(std::shared_ptr<ImageBuffer::State> owner, const std::uintptr_t product_completion = 0U,
                    std::shared_ptr<void> shared_product_lease = {}, const std::uint64_t product_generation = 0U,
-                   std::shared_lock<std::shared_mutex>* shared_product_lock = nullptr)
+                   std::shared_lock<std::shared_mutex>* shared_product_lock = nullptr,
+                   std::shared_ptr<const std::function<void()>> availability = {})
         : state(std::move(owner)),
           completion(product_completion == 0U ? state->completion : product_completion),
           product_lease(std::move(shared_product_lease)),
           product_lock(shared_product_lock),
           lock(state->access),
-          revision(product_lease ? product_generation : state->revision) {}
+          revision(product_lease ? product_generation : state->revision),
+          availability(std::move(availability)) {}
     ~Lease() {
         if (lock.owns_lock()) {
-            // The ordinary owner is alive (and may be waiting on this lock).
-            // Drop shared custody before waking it so physical retirement stays
-            // on that owner's context-bound path.
-            state.reset();
             lock.unlock();
+            state.reset();
         }
     }
     std::shared_ptr<ImageBuffer::State> state;
@@ -429,6 +436,7 @@ struct BorrowedImageReadView::Lease final {
     std::shared_lock<std::shared_mutex>* product_lock = nullptr;
     std::shared_lock<std::shared_mutex> lock;
     std::uint64_t revision = 0U;
+    std::shared_ptr<const std::function<void()>> availability;
 };
 
 BorrowedImageReadView::BorrowedImageReadView() noexcept = default;
@@ -448,6 +456,9 @@ void BorrowedImageReadView::Quarantine() noexcept {
     lease_->state->unavailable.store(true, std::memory_order_release);
     if (lease_->lock.owns_lock()) lease_->lock.unlock();
     if (lease_->product_lock && lease_->product_lock->owns_lock()) lease_->product_lock->unlock();
+    if (lease_->availability) {
+        try { (*lease_->availability)(); } catch (...) {}
+    }
 }
 
 ImageBuffer::ImageBuffer(DeviceContext context) : state_(std::make_shared<State>(std::move(context))) {}
@@ -522,11 +533,18 @@ ImageCopyPath ImageBuffer::CopyFrom(ImageStream& stream, BorrowedImageReadView s
         backend.RecordEvent(state_->context.state_->context, stream.stream_, state_->completion);
         auto settled = stream.Settle();
         receiver_completed = settled.completion_reached;
-        RequireSettlement(std::move(settled));
+        if (!settled.completion_reached || settled.failure) ThrowExecutionFailure(settled);
         state_->revision = next_revision;
         return path;
     } catch (...) {
-        if (reads_submitted && !receiver_completed) receiver_completed = RetainUnsettledRead(stream, source, state_->unsettled_source);
+        if (reads_submitted && !receiver_completed) {
+            const auto settled = RetainUnsettledRead(stream, source, state_->unsettled_source);
+            receiver_completed = settled.completion_reached;
+            if (!receiver_completed || settled.failure) {
+                LogCopyFailure(state_->context, "scalar", receiver_completed);
+                ThrowExecutionFailure(settled, std::current_exception());
+            }
+        }
         LogCopyFailure(state_->context, "scalar", !reads_submitted || receiver_completed);
         throw;
     }
@@ -602,13 +620,12 @@ struct BorrowedImageProductReadView::Lease final {
     explicit Lease(std::shared_ptr<ImageProductBuffer::State> owner)
         : product(std::move(owner)), lock(product->transaction_), generation(product->generation_) {}
     ~Lease() {
-        std::shared_ptr<const std::function<void()>> availability;
-        if (lock.owns_lock()) {
-            availability = product->availability_sink_;
-            product.reset();
-            lock.unlock();
+        const auto availability = product->availability_sink_;
+        if (lock.owns_lock()) lock.unlock();
+        product.reset();
+        if (availability) {
+            try { (*availability)(); } catch (...) {}
         }
-        if (availability) (*availability)();
     }
     // CLEANUP-IGNORE: Product leases lock a transaction; plane leases lock individual buffer storage and retain
     // completion facts.
@@ -768,7 +785,14 @@ std::array<ImageCopyPath, 2U> ImageProductBuffer::CopyFromAs(ImageStream& stream
         state_->generation_ = next_generation;
         return paths;
     } catch (...) {
-        if (reads_submitted && !receiver_completed) receiver_completed = RetainUnsettledRead(stream, source, state_->unsettled_source_);
+        if (reads_submitted && !receiver_completed) {
+            const auto settled = RetainUnsettledRead(stream, source, state_->unsettled_source_);
+            receiver_completed = settled.completion_reached;
+            if (!receiver_completed || settled.failure) {
+                LogCopyFailure(state_->context_, "product", receiver_completed);
+                ThrowExecutionFailure(settled, std::current_exception());
+            }
+        }
         LogCopyFailure(state_->context_, "product", !reads_submitted || receiver_completed);
         throw;
     }
@@ -778,7 +802,8 @@ BorrowedImageProductReadView ImageProductBuffer::Borrow() const {
     result.count_ = state_->plane_count_;
     for (std::size_t index = 0U; index != state_->plane_count_; ++index)
         result.planes_[index] = BorrowedImageReadView{std::make_unique<BorrowedImageReadView::Lease>(
-            state_->planes_[index]->state_, state_->completion_, result.lease_, result.lease_->generation, &result.lease_->lock)};
+            state_->planes_[index]->state_, state_->completion_, result.lease_, result.lease_->generation, &result.lease_->lock,
+            state_->availability_sink_)};
     if (!result.valid()) return {};
     return result;
 }
@@ -795,274 +820,30 @@ std::uint64_t ImageProductBuffer::revision() const noexcept {
     std::shared_lock transaction(state_->transaction_);
     return state_->generation_;
 }
-bool ImageProductBuffer::writable() const noexcept {
+bool ImageProductBuffer::writable() const {
+    if (terminal()) throw std::runtime_error("image product storage is quarantined");
     std::unique_lock transaction(state_->transaction_, std::try_to_lock);
-    if (!transaction.owns_lock() || state_->unsettled_source_) return false;
+    if (!transaction.owns_lock()) return false;
+    if (state_->unsettled_source_) throw std::runtime_error("image product retains an unsettled source");
     std::array<std::unique_lock<std::shared_mutex>, 2U> locks;
     for (std::size_t index = 0U; index != state_->plane_count_; ++index) {
         locks[index] = std::unique_lock{state_->planes_[index]->state_->access, std::try_to_lock};
-        if (!locks[index].owns_lock() || state_->planes_[index]->state_->unavailable.load(std::memory_order_acquire)) return false;
+        if (!locks[index].owns_lock()) return false;
+        if (state_->planes_[index]->state_->unavailable.load(std::memory_order_acquire))
+            throw std::runtime_error("image product storage is quarantined");
     }
     return true;
+}
+bool ImageProductBuffer::terminal() const noexcept {
+    for (std::size_t index = 0U; index != state_->plane_count_; ++index)
+        if (state_->planes_[index]->state_->unavailable.load(std::memory_order_acquire)) return true;
+    return false;
+}
+bool ImageProductBuffer::Owns(const BorrowedImageProductReadView& source) const noexcept {
+    return source.lease_ && source.lease_->product == state_;
 }
 void ImageProductBuffer::SetAvailabilitySink(std::shared_ptr<const std::function<void()>> sink) {
     std::unique_lock transaction(state_->transaction_);
     state_->availability_sink_ = std::move(sink);
 }
-std::size_t ImageProductBuffer::index(const ImagePlaneKind kind) const {
-    if (kind == ImagePlaneKind::Clean) return 0U;
-    if (kind == ImagePlaneKind::Semantic && state_->plane_count_ == 2U) return 1U;
-    throw std::invalid_argument("image product does not own the requested plane");
-}
-
-struct ImageProductPool::State final {
-    State(DeviceContext context, const ImageProductLayout layout, const std::size_t count) {
-        if (count == 0U) throw std::invalid_argument("image product pool is empty");
-        buffers.reserve(count);
-        candidates.assign(count, false);
-        products.assign(count, 0U);
-        for (std::size_t index = 0U; index != count; ++index)
-            buffers.push_back(std::make_unique<ImageProductBuffer>(context, layout));
-    }
-
-    void Available() noexcept {
-        std::shared_ptr<const std::function<void()>> retained;
-        {
-            std::scoped_lock lock(mutex);
-            retained = availability_sink;
-        }
-        available.notify_all();
-        if (!retained) return;
-        try {
-            (*retained)();
-        } catch (...) {}
-    }
-
-    std::vector<std::unique_ptr<ImageProductBuffer>> buffers;
-    std::vector<bool> candidates;
-    std::vector<std::size_t> products;
-    mutable std::mutex mutex;
-    std::condition_variable_any available;
-    std::optional<std::size_t> selected;
-    std::shared_ptr<const std::function<void()>> availability_sink;
-};
-
-ImageProductPool::Product::Product(std::shared_ptr<State> state, const std::size_t index, const std::uint64_t revision) noexcept
-    : state_(std::move(state)), index_(index), revision_(revision) {}
-ImageProductPool::Product::~Product() { Release(); }
-ImageProductPool::Product::Product(const Product& other)
-    : state_(other.state_), index_(other.index_), revision_(other.revision_) {
-    Retain();
-}
-ImageProductPool::Product& ImageProductPool::Product::operator=(const Product& other) {
-    if (this == &other) return *this;
-    Release();
-    state_ = other.state_;
-    index_ = other.index_;
-    revision_ = other.revision_;
-    Retain();
-    return *this;
-}
-ImageProductPool::Product::Product(Product&& other) noexcept
-    : state_(std::move(other.state_)), index_(other.index_), revision_(std::exchange(other.revision_, 0U)) {}
-ImageProductPool::Product& ImageProductPool::Product::operator=(Product&& other) noexcept {
-    if (this == &other) return *this;
-    Release();
-    state_ = std::move(other.state_);
-    index_ = other.index_;
-    revision_ = std::exchange(other.revision_, 0U);
-    return *this;
-}
-bool ImageProductPool::Product::valid() const noexcept {
-    if (!state_ || revision_ == 0U) return false;
-    std::scoped_lock lock(state_->mutex);
-    return state_->products[index_] != 0U && state_->buffers[index_]->revision() == revision_;
-}
-std::uint64_t ImageProductPool::Product::revision() const noexcept { return valid() ? revision_ : 0U; }
-BorrowedImageProductReadView ImageProductPool::Product::Borrow() const {
-    if (!state_ || revision_ == 0U) return {};
-    std::scoped_lock lock(state_->mutex);
-    if (state_->products[index_] == 0U || state_->buffers[index_]->revision() != revision_) return {};
-    return state_->buffers[index_]->Borrow();
-}
-void ImageProductPool::Product::Retain() {
-    if (!state_) return;
-    std::scoped_lock lock(state_->mutex);
-    ++state_->products[index_];
-}
-void ImageProductPool::Product::Release() noexcept {
-    if (!state_) return;
-    {
-        std::scoped_lock lock(state_->mutex);
-        if (state_->products[index_] != 0U) --state_->products[index_];
-    }
-    auto state = std::move(state_);
-    revision_ = 0U;
-    state->Available();
-}
-
-ImageProductPool::Candidate::Candidate(std::shared_ptr<State> state, const std::size_t index) noexcept
-    : state_(std::move(state)), index_(index) {}
-ImageProductPool::Candidate::~Candidate() { Release(); }
-ImageProductPool::Candidate::Candidate(Candidate&& other) noexcept
-    : state_(std::move(other.state_)),
-      index_(other.index_),
-      revision_(other.revision_),
-      published_(std::exchange(other.published_, false)) {}
-ImageProductPool::Candidate& ImageProductPool::Candidate::operator=(Candidate&& other) noexcept {
-    if (this == &other) return *this;
-    Release();
-    state_ = std::move(other.state_);
-    index_ = other.index_;
-    revision_ = other.revision_;
-    published_ = std::exchange(other.published_, false);
-    return *this;
-}
-bool ImageProductPool::Candidate::valid() const noexcept { return state_ != nullptr; }
-std::uint64_t ImageProductPool::Candidate::revision() const noexcept { return published_ ? revision_ : 0U; }
-void ImageProductPool::Candidate::Release() noexcept {
-    if (!state_) return;
-    {
-        std::scoped_lock lock(state_->mutex);
-        state_->candidates[index_] = false;
-    }
-    auto state = std::move(state_);
-    state->Available();
-}
-
-ImageProductPool::ImageProductPool(DeviceContext context, const ImageProductLayout layout, const std::size_t count)
-    : state_(std::make_shared<State>(std::move(context), layout, count)) {
-    const auto wake = std::make_shared<const std::function<void()>>([state = std::weak_ptr{state_}] {
-        if (const auto retained = state.lock()) retained->Available();
-    });
-    for (auto& buffer : state_->buffers)
-        buffer->SetAvailabilitySink(wake);
-}
-ImageProductPool::~ImageProductPool() = default;
-
-ImageProductPool::Candidate ImageProductPool::Acquire(const std::stop_token stop) {
-    std::unique_lock lock(state_->mutex);
-    const auto find = [&]() -> std::optional<std::size_t> {
-        for (std::size_t index = 0U; index != state_->buffers.size(); ++index) {
-            if (state_->candidates[index] || state_->products[index] != 0U || (state_->selected && *state_->selected == index)) continue;
-            if (state_->buffers[index]->writable()) return index;
-        }
-        if (state_->buffers.size() == 1U && state_->selected && !state_->candidates[*state_->selected] &&
-            state_->products[*state_->selected] == 0U &&
-            state_->buffers[*state_->selected]->writable())
-            return state_->selected;
-        return std::nullopt;
-    };
-    auto available = find();
-    while (!available && !stop.stop_requested()) {
-        if (stop.stop_possible())
-            state_->available.wait(lock, stop, [&] { return stop.stop_requested() || find().has_value(); });
-        else
-            state_->available.wait(lock, [&] { return find().has_value(); });
-        available = find();
-    }
-    if (!available) return {};
-    state_->candidates[*available] = true;
-    return Candidate{state_, *available};
-}
-
-void ImageProductPool::Publish(ImageStream& stream, Candidate& candidate, const std::uint32_t width, const std::uint32_t height,
-                               const std::uint64_t revision, const ImageCandidateInitialization initialization,
-                               ImageProductBuffer::ProductSubmit submit) {
-    if (!candidate.valid() || candidate.state_ != state_ || candidate.published_)
-        throw std::invalid_argument("image product candidate is invalid");
-    try {
-        bool initialized = false;
-        if (initialization == ImageCandidateInitialization::PreserveSelected) {
-            BorrowedImageProductReadView selected;
-            std::optional<std::size_t> selected_index;
-            {
-                std::scoped_lock lock(state_->mutex);
-                selected_index = state_->selected;
-                if (selected_index && *selected_index != candidate.index_) selected = state_->buffers[*selected_index]->Borrow();
-            }
-            if (selected_index && *selected_index == candidate.index_) {
-                initialized = true;
-            } else if (selected.valid()) {
-                const auto descriptor = selected.plane(0U).plane().descriptor;
-                if (descriptor.width == width && descriptor.height == height &&
-                    selected.plane_count() == state_->buffers[candidate.index_]->state_->plane_count_) {
-                    static_cast<void>(state_->buffers[candidate.index_]->CopyFrom(stream, std::move(selected)));
-                    initialized = true;
-                }
-            }
-        }
-        state_->buffers[candidate.index_]->PublishAs(stream, width, height, revision, !initialized, std::move(submit));
-        stream.Synchronize();
-    } catch (...) {
-        const auto submission = std::current_exception();
-        const auto settled = stream.Settle();
-        if (!settled.completion_reached || settled.failure) ThrowExecutionFailure(settled);
-        std::rethrow_exception(submission);
-    }
-    candidate.revision_ = revision;
-    candidate.published_ = true;
-}
-
-std::array<ImageCopyPath, 2U> ImageProductPool::CopyFrom(ImageStream& stream, BorrowedImageProductReadView source,
-                                                        const std::uint64_t revision) {
-    if (revision == 0U) throw std::invalid_argument("image product revision is invalid");
-    auto candidate = Acquire();
-    if (!candidate.valid()) throw std::runtime_error("image output candidate is unavailable");
-    auto paths = state_->buffers[candidate.index_]->CopyFromAs(stream, std::move(source), {}, revision);
-    candidate.revision_ = revision;
-    candidate.published_ = true;
-    static_cast<void>(Commit(std::move(candidate)));
-    return paths;
-}
-
-ImageProductPool::Product ImageProductPool::Commit(Candidate&& candidate) {
-    if (!candidate.valid() || candidate.state_ != state_ || !candidate.published_)
-        throw std::invalid_argument("image product candidate is incomplete");
-    Product completed;
-    {
-        std::scoped_lock lock(state_->mutex);
-        if (state_->buffers[candidate.index_]->revision() != candidate.revision_)
-            throw std::logic_error("image product candidate revision changed before commitment");
-        state_->selected = candidate.index_;
-        state_->candidates[candidate.index_] = false;
-        ++state_->products[candidate.index_];
-        completed = Product{state_, candidate.index_, candidate.revision_};
-    }
-    candidate.state_.reset();
-    state_->Available();
-    return completed;
-}
-
-void ImageProductPool::Select(const Product& product) {
-    if (!product.state_ || product.state_ != state_ || product.revision_ == 0U)
-        throw std::invalid_argument("completed image product is invalid");
-    {
-        std::scoped_lock lock(state_->mutex);
-        if (state_->products[product.index_] == 0U || state_->buffers[product.index_]->revision() != product.revision_)
-            throw std::invalid_argument("completed image product is unavailable");
-        state_->selected = product.index_;
-    }
-    state_->Available();
-}
-
-BorrowedImageProductReadView ImageProductPool::Borrow() const {
-    std::scoped_lock lock(state_->mutex);
-    return state_->selected ? state_->buffers[*state_->selected]->Borrow() : BorrowedImageProductReadView{};
-}
-ImageProductBuffer& ImageProductPool::selected() {
-    std::scoped_lock lock(state_->mutex);
-    return *state_->buffers[state_->selected.value_or(0U)];
-}
-const ImageProductBuffer& ImageProductPool::selected() const {
-    std::scoped_lock lock(state_->mutex);
-    return *state_->buffers[state_->selected.value_or(0U)];
-}
-void ImageProductPool::SetAvailabilitySink(std::function<void()> sink) {
-    auto retained = sink ? std::make_shared<const std::function<void()>>(std::move(sink)) : nullptr;
-    std::scoped_lock lock(state_->mutex);
-    state_->availability_sink = std::move(retained);
-}
-std::size_t ImageProductPool::size() const noexcept { return state_->buffers.size(); }
-
 }  // namespace mmltk::frameworks::gpu

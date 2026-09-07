@@ -5,25 +5,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <array>
-#include <condition_variable>
 #include <functional>
 #include <exception>
 #include <memory>
-#include <mutex>
-#include <shared_mutex>
 #include <stdexcept>
-#include <stop_token>
-#include <vector>
 
 #include "src/frameworks/gpu/image_geometry.h"
+#include "src/frameworks/gpu/image_failure.h"
 #include "src/frameworks/gpu/image_types.h"
 
 namespace mmltk::frameworks::gpu {
-
-class ImageStreamExecutionFailure : public std::runtime_error {
-   public:
-    using std::runtime_error::runtime_error;
-};
 
 class ImageCopyBackend {
    public:
@@ -101,11 +92,13 @@ class ImageStream final {
     // receiver reads settle, including partial submission and exceptions.
     void Await(const BorrowedImageProductReadView&);
     [[nodiscard]] ImageCopyBackend::StreamSettlement Settle() noexcept;
+    [[noreturn]] void RethrowAfterSettlement(std::exception_ptr);
     [[nodiscard]] std::uintptr_t native_handle() const noexcept { return stream_; }
 
    private:
     DeviceContext context_;
     std::uintptr_t stream_ = 0U;
+    std::exception_ptr settlement_failure_;
     friend class ImageBuffer;
     friend class ImageProductBuffer;
 };
@@ -216,83 +209,11 @@ class ImageProductBuffer final {
     void PublishAs(ImageStream&, std::uint32_t, std::uint32_t, std::uint64_t, bool, ProductSubmit);
     [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFromAs(ImageStream&, BorrowedImageProductReadView, MissingPlaneSubmit,
                                                           std::uint64_t);
-    [[nodiscard]] bool writable() const noexcept;
+    [[nodiscard]] bool writable() const;
+    [[nodiscard]] bool terminal() const noexcept;
+    [[nodiscard]] bool Owns(const BorrowedImageProductReadView&) const noexcept;
     void SetAvailabilitySink(std::shared_ptr<const std::function<void()>>);
-    [[nodiscard]] std::size_t index(ImagePlaneKind) const;
     struct State;
-    std::shared_ptr<State> state_;
-};
-
-enum class ImageCandidateInitialization : std::uint8_t {
-    Empty,
-    PreserveSelected,
-};
-
-class ImageProductPool final {
-   private:
-    struct State;
-
-   public:
-    class Product final {
-       public:
-        Product() noexcept = default;
-        ~Product();
-        Product(const Product&);
-        Product& operator=(const Product&);
-        Product(Product&&) noexcept;
-        Product& operator=(Product&&) noexcept;
-        [[nodiscard]] bool valid() const noexcept;
-        [[nodiscard]] std::uint64_t revision() const noexcept;
-        [[nodiscard]] BorrowedImageProductReadView Borrow() const;
-
-       private:
-        Product(std::shared_ptr<State>, std::size_t, std::uint64_t) noexcept;
-        void Retain();
-        void Release() noexcept;
-        std::shared_ptr<State> state_;
-        std::size_t index_ = 0U;
-        std::uint64_t revision_ = 0U;
-        friend class ImageProductPool;
-    };
-
-    class Candidate final {
-       public:
-        Candidate() noexcept = default;
-        ~Candidate();
-        Candidate(const Candidate&) = delete;
-        Candidate& operator=(const Candidate&) = delete;
-        Candidate(Candidate&&) noexcept;
-        Candidate& operator=(Candidate&&) noexcept;
-        [[nodiscard]] bool valid() const noexcept;
-        [[nodiscard]] std::uint64_t revision() const noexcept;
-
-       private:
-        Candidate(std::shared_ptr<State>, std::size_t) noexcept;
-        void Release() noexcept;
-        std::shared_ptr<State> state_;
-        std::size_t index_ = 0U;
-        std::uint64_t revision_ = 0U;
-        bool published_ = false;
-        friend class ImageProductPool;
-    };
-
-    ImageProductPool(DeviceContext, ImageProductLayout, std::size_t);
-    ~ImageProductPool();
-    ImageProductPool(const ImageProductPool&) = delete;
-    ImageProductPool& operator=(const ImageProductPool&) = delete;
-    [[nodiscard]] Candidate Acquire(std::stop_token = {});
-    void Publish(ImageStream&, Candidate&, std::uint32_t, std::uint32_t, std::uint64_t, ImageCandidateInitialization,
-                 ImageProductBuffer::ProductSubmit);
-    [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(ImageStream&, BorrowedImageProductReadView, std::uint64_t);
-    Product Commit(Candidate&&);
-    void Select(const Product&);
-    [[nodiscard]] BorrowedImageProductReadView Borrow() const;
-    [[nodiscard]] ImageProductBuffer& selected();
-    [[nodiscard]] const ImageProductBuffer& selected() const;
-    void SetAvailabilitySink(std::function<void()>);
-    [[nodiscard]] std::size_t size() const noexcept;
-
-   private:
     std::shared_ptr<State> state_;
 };
 

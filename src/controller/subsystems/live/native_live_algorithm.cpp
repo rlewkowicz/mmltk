@@ -1,5 +1,5 @@
 #include "src/controller/subsystems/live/live_system.h"
-#include "src/frameworks/gpu/system_image_worker.h"
+#include "src/frameworks/gpu/system_image_runtime.h"
 
 #include <cuda_runtime_api.h>
 
@@ -124,12 +124,13 @@ class NativeLiveAlgorithm final : public LiveAlgorithm {
 
 VisualRuntimeFactory make_native_live_runtime_factory(const VisualDeviceSettings settings, LiveNativeConfiguration configuration) {
     if (!settings.valid()) throw contracts::InvalidIntentError("Live device settings are invalid");
-    return [settings, execution = resolve_visual_device_execution(settings), configuration = std::move(configuration)] {
+    return [settings, execution = resolve_visual_device_execution(settings), configuration = std::move(configuration)](auto revisions) {
         return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
             .device = settings.device,
             .model = std::make_unique<NativeLiveAlgorithm>(settings, configuration, execution),
             .numa_node = settings.numa_node,
             .execution = execution,
+            .product_revisions = std::move(revisions),
         });
     };
 }

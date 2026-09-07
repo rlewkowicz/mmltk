@@ -16,6 +16,7 @@
 #include "src/common/system/cpu_affinity.h"
 #include "src/common/system/execution_policy.h"
 #include "src/frameworks/gpu/cuda_error.h"
+#include "src/frameworks/gpu/image_failure.h"
 #include "src/frameworks/gpu/cuda_high_water_allocation.h"
 #include "src/frameworks/gpu/cuda_priority.h"
 #include "src/frameworks/gpu/pinned_host_buffer.h"
@@ -462,7 +463,8 @@ void CompiledImageStream::prepare_device(const std::size_t index, const std::siz
         // settle unrelated reads or GPU consumers.
         try {
             buffer.ensure_bytes(bytes);
-        } catch (const gpu::GdrTransportUnavailable&) { throw; } catch (const std::exception& error) {
+        } catch (const std::exception& error) {
+            if (gpu::find_image_failure<gpu::GdrTransportUnavailable>(std::current_exception())) throw;
             throw std::runtime_error(
                 "compiled image loading on CUDA device " + std::to_string(impl_->config.device) +
                 (impl_->config.loading.h2d_dataloader ? " using H2D: " : " requires GDRCopy (omit --gdrcopy for H2D): ") + error.what());

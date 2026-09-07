@@ -137,6 +137,10 @@ implementation naturally forms one coherent cutover.
   clarification; inspect later phases for material impact, remove completed
   phases entirely, and leave only remaining actionable steps. Record pertinent
   detours in the active phase while it remains actionable.
+- After removing a completed phase, rewrite every surviving dependency, action,
+  risk, and handoff that referenced it to name the concrete implemented API,
+  owner, artifact, or invariant. An executable plan must not rely on the number,
+  title, or prose of a phase that is no longer present.
 - Before closing an implementation phase, spawn exactly one sol xhigh
   reviewer after the work is complete. Give it the relevant complete diff.
   Wait for its report and use the report before updating the executor. Use

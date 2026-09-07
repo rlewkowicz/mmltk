@@ -42,7 +42,8 @@
 #include "src/controller/subsystems/upscale/upscale_system.h"
 #include "src/common/types/generation.h"
 #include "src/controller/presentation/detail/visual_runtime_owner.h"
-#include "src/frameworks/gpu/system_image_worker.h"
+#include "src/frameworks/gpu/system_image_runtime.h"
+#include "src/frameworks/gpu/image_failure.h"
 #include "src/controller/presentation/detail/workspace_frame_signal.h"
 #include "src/controller/presentation/detail/workspace_surface_import_channel.h"
 #include "src/controller/services/settings_system.h"
@@ -647,7 +648,7 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
                           [probe = std::move(probe)] { return std::make_unique<ControlledStreamingExploreAlgorithm>(probe); }, 2U);
 }
 
-class TestExploreAlgorithm final : public SynchronousExploreAlgorithm {
+class TestExploreAlgorithm : public SynchronousExploreAlgorithm {
    public:
     explicit TestExploreAlgorithm(std::shared_ptr<std::atomic<std::size_t>> observed_nproc, std::shared_ptr<ExploreRenderGate> gate = {},
                                   std::shared_ptr<std::atomic_uint64_t> commits = {},
@@ -1951,10 +1952,12 @@ class MutableVisualSource final {
     }
     void SetSemantics(const std::uint8_t value) {
         const auto current = frame();
-        runtime_.Publish(current.extent.width, current.extent.height,
+        auto candidate = runtime_.AcquireOutput({}, runtime_.Completed());
+        runtime_.Publish(candidate, current.extent.width, current.extent.height,
                          [value](const auto, const auto semantic, const auto) { Fill(semantic, value); });
+        static_cast<void>(runtime_.CommitOutput(std::move(candidate)));
         std::scoped_lock lock(mutex_);
-        frame_.revision = runtime_.output().revision();
+        frame_.revision = runtime_.OutputFacts().revision;
         snapshot_revision_ = mmltk::common::types::advance_monotonic_identity(snapshot_revision_);
     }
     [[nodiscard]] VisualFrame frame() const {
@@ -2442,9 +2445,9 @@ TEST_CASE("Explore Open rejects never-loaded settings before runtime constructio
         0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
         [] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U)); }, 2U);
     ExploreSystem explore{settings, kDevice, 2U,
-                          [factory = std::move(factory), constructions]() mutable {
+                          [factory = std::move(factory), constructions](auto revisions) mutable {
                               constructions->fetch_add(1U, std::memory_order_release);
-                              return factory();
+                              return factory(std::move(revisions));
                           },
                           [events](ExploreSystem::event_type) { events->fetch_add(1U, std::memory_order_release); }};
     const auto before = explore.snapshot();
@@ -3431,6 +3434,37 @@ TEST_CASE("Explore unavailable runtime and selected transport publish distinct t
     CHECK(failed.maximum_atlas_extent.valid());
 }
 
+class TransportFailingExploreAlgorithm final : public TestExploreAlgorithm {
+   public:
+    explicit TransportFailingExploreAlgorithm(bool safe)
+        : TestExploreAlgorithm(std::make_shared<std::atomic<std::size_t>>(0U)), safe_(safe),
+          retirement_(std::make_exception_ptr(std::runtime_error("distinct Explore retirement failure"))) {}
+    ExploreOpened Open(std::string_view, std::stop_token) override {
+        throw mmltk::frameworks::gpu::GdrTransportUnavailable("selected GDR transport unavailable");
+    }
+    [[nodiscard]] Release ReleaseResources() noexcept override {
+        return {.all_released = safe_, .failure = retirement_};
+    }
+   private:
+    bool safe_;
+    std::exception_ptr retirement_;
+};
+
+TEST_CASE("Explore preserves selected transport classification through safe and unsafe retirement failures") {
+    const bool safe = GENERATE(false, true);
+    LoadedSettings settings;
+    auto backend = std::make_shared<FakeImageBackend>();
+    ExploreScenario scenario{settings, backend, [safe] {
+        return std::make_unique<TransportFailingExploreAlgorithm>(safe);
+    }};
+    static_cast<void>(scenario.system().Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/test"}));
+    REQUIRE(scenario.Wait([&] { return !scenario.system().snapshot().failure.empty(); }));
+    CHECK(scenario.system().snapshot().failure_kind == ExploreFailureKind::SelectedTransportUnavailable);
+    CHECK(scenario.system().snapshot().failure == "selected GDR transport unavailable");
+    CHECK_FALSE(scenario.system().snapshot().busy);
+    CHECK_FALSE(scenario.system().snapshot().ready);
+}
+
 TEST_CASE("Explore visibility preserves active augmentation and labels preserve the product") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto probe = std::make_shared<ExploreWorkProbe>();
@@ -4097,7 +4131,8 @@ TEST_CASE("Upscale CUDA tile replay preserves reference pixels and pitched recei
     std::array<std::vector<std::uint8_t>, 6U> reference;
     for (const bool reference_run : {true, false}) {
         REQUIRE(::setenv("MMLTK_UPSCALE_ONNX_REFERENCE", reference_run ? "1" : "0", 1) == 0);
-        auto runtime = make_native_upscale_runtime_factory(kDevice)();
+        auto runtime = make_native_upscale_runtime_factory(kDevice)(
+            std::make_shared<mmltk::frameworks::gpu::ImageProductRevisionSequence>());
         runtime->BeginWork();
         auto* model = dynamic_cast<UpscaleAlgorithm*>(runtime->model());
         REQUIRE(model != nullptr);
@@ -4176,7 +4211,8 @@ TEST_CASE("Upscale CUDA tile replay preserves reference pixels and pitched recei
 TEST_CASE("Native Upscale warm aggregate retires before model and primary context destruction") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
 
-    auto runtime = make_native_upscale_runtime_factory(kDevice)();
+    auto runtime = make_native_upscale_runtime_factory(kDevice)(
+        std::make_shared<mmltk::frameworks::gpu::ImageProductRevisionSequence>());
     runtime->BeginWork();
     auto* const model = dynamic_cast<UpscaleAlgorithm*>(runtime->model());
     REQUIRE(model != nullptr);
@@ -4938,10 +4974,10 @@ TEST_CASE("visual runtime reconstructs after consecutive factory failures") {
     EventGate failure_events;
     std::promise<void> completed;
     auto successful = test_live_runtime_factory(backend, captures);
-    detail::VisualRuntimeOwner owner{[attempts, successful = std::move(successful)]() mutable {
+    detail::VisualRuntimeOwner owner{[attempts, successful = std::move(successful)](auto revisions) mutable {
                                          if (attempts->fetch_add(1U, std::memory_order_acq_rel) < 2U)
                                              throw std::runtime_error("deterministic construction failure");
-                                         return successful();
+                                         return successful(std::move(revisions));
                                      },
                                      [failures, &failure_events](std::exception_ptr) {
                                          failures->fetch_add(1U, std::memory_order_acq_rel);
@@ -4968,7 +5004,7 @@ TEST_CASE("visual producer revisions remain unique across staged runtime reconst
     detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
     REQUIRE(owner.SubmitOrdered([&first_completed](auto& runtime, std::stop_token) {
         runtime.Publish(8U, 8U, [](auto, auto, auto) {});
-        const auto revision = runtime.output().revision();
+        const auto revision = runtime.OutputFacts().revision;
         return detail::VisualRuntimeOwner::Notification{
             [&first_completed, revision] { first_completed.set_value(revision); }};
     }));
@@ -4976,7 +5012,7 @@ TEST_CASE("visual producer revisions remain unique across staged runtime reconst
     REQUIRE(owner.SubmitDiscrete(
         [&replacement_completed](auto& runtime, std::stop_token) {
             runtime.Publish(8U, 8U, [](auto, auto, auto) {});
-            const auto revision = runtime.output().revision();
+            const auto revision = runtime.OutputFacts().revision;
             return detail::VisualRuntimeOwner::Notification{
                 [&replacement_completed, revision] { replacement_completed.set_value(revision); }};
         },
@@ -4995,15 +5031,15 @@ TEST_CASE("failed visual runtime replacement keeps the exact completed product")
     std::promise<std::uint64_t> first_completed;
     std::promise<void> failed;
     detail::VisualRuntimeOwner owner{
-        [attempts, successful = std::move(successful)]() mutable {
+        [attempts, successful = std::move(successful)](auto revisions) mutable {
             if (attempts->fetch_add(1U, std::memory_order_acq_rel) == 1U)
                 throw std::runtime_error("deterministic replacement failure");
-            return successful();
+            return successful(std::move(revisions));
         },
         [&failed](std::exception_ptr) { failed.set_value(); }};
     REQUIRE(owner.SubmitOrdered([&first_completed](auto& runtime, std::stop_token) {
         runtime.Publish(8U, 8U, [](auto, auto, auto) {});
-        const auto revision = runtime.output().revision();
+        const auto revision = runtime.OutputFacts().revision;
         return detail::VisualRuntimeOwner::Notification{
             [&first_completed, revision] { first_completed.set_value(revision); }};
     }));
@@ -5025,6 +5061,201 @@ TEST_CASE("failed visual runtime replacement keeps the exact completed product")
     retained = owner.Borrow();
     REQUIRE(retained.valid());
     CHECK(retained.plane(0U).revision() == first_revision);
+    retained = {};
+    owner.StopAndWait();
+}
+
+TEST_CASE("staged cancellation keeps incumbent pixels visible until replacement settlement") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
+    std::promise<std::uint64_t> first;
+    std::promise<void> submitted;
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    std::promise<void> settled;
+    std::atomic_bool success_notified = false;
+    detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
+    REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
+        runtime.Publish(8U, 8U, [](auto, auto, auto) {});
+        const auto revision = runtime.Completed().revision();
+        return detail::VisualRuntimeOwner::Notification{[&, revision] { first.set_value(revision); }};
+    }));
+    const auto incumbent = first.get_future().get();
+    REQUIRE(owner.SubmitDiscrete([&](auto& runtime, std::stop_token) {
+        runtime.Publish(8U, 8U, [](auto, auto, auto) {});
+        submitted.set_value();
+        released.wait();
+        return detail::VisualRuntimeOwner::Notification{[&] { success_notified = true; }};
+    }, [&] { settled.set_value(); }, true));
+    submitted.get_future().wait();
+    auto read = owner.Borrow();
+    const auto revision = read.valid() ? read.plane(0U).revision() : 0U;
+    read = {};
+    owner.RequestActiveStop();
+    release.set_value();
+    REQUIRE(settled.get_future().wait_for(2s) == std::future_status::ready);
+    CHECK(revision == incumbent);
+    CHECK_FALSE(success_notified.load());
+    auto retained = owner.Borrow();
+    REQUIRE(retained.valid());
+    CHECK(retained.plane(0U).revision() == incumbent);
+    retained = {};
+    owner.StopAndWait();
+}
+
+TEST_CASE("staged completion wins late stop before promotion and publishes its exact borrowed product") {
+    const bool producer_claims_completion = GENERATE(false, true);
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
+    std::promise<void> first;
+    std::promise<void> latched;
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    std::promise<std::uint64_t> published;
+    std::atomic_bool cancelled = false;
+    detail::VisualRuntimeOwner owner{
+        test_live_runtime_factory(backend, captures), [](std::exception_ptr) {},
+        [&](detail::VisualRuntimeOwner::ActivityStage stage, std::uint64_t completed) noexcept {
+            if (!producer_claims_completion &&
+                stage == detail::VisualRuntimeOwner::ActivityStage::StagedCompletionLatched && completed != 0U) {
+                latched.set_value();
+                released.wait();
+            }
+        }};
+    REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
+        runtime.Publish(8U, 8U, [](auto, auto, auto) {});
+        return detail::VisualRuntimeOwner::Notification{[&] { first.set_value(); }};
+    }));
+    first.get_future().wait();
+    auto prior = owner.Borrow();
+    const auto prior_revision = prior.plane(0U).revision();
+    prior = {};
+    REQUIRE(owner.SubmitDiscrete([&](auto& runtime, std::stop_token) {
+        if (producer_claims_completion && !owner.TryCompleteActiveWork())
+            throw std::runtime_error("producer completion unexpectedly cancelled");
+        runtime.Publish(8U, 8U, [](auto, auto, auto) {});
+        const auto revision = runtime.Completed().revision();
+        if (producer_claims_completion) {
+            latched.set_value();
+            released.wait();
+        }
+        return detail::VisualRuntimeOwner::Notification{[&, revision] { published.set_value(revision); }};
+    }, [&] { cancelled = true; }, true));
+    latched.get_future().wait();
+    owner.RequestActiveStop();
+    release.set_value();
+    auto publication = published.get_future();
+    REQUIRE(publication.wait_for(2s) == std::future_status::ready);
+    auto borrowed = owner.Borrow();
+    REQUIRE(borrowed.valid());
+    const auto revision = publication.get();
+    CHECK(revision > prior_revision);
+    CHECK(borrowed.plane(0U).revision() == revision);
+    CHECK_FALSE(cancelled.load());
+    borrowed = {};
+    owner.StopAndWait();
+}
+
+TEST_CASE("runtime construction does not hold scheduler admission while stop is requested") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
+    auto factory = test_live_runtime_factory(backend, captures);
+    std::promise<void> constructing;
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    std::atomic_bool entered = false;
+    detail::VisualRuntimeOwner owner{
+        [&, factory = std::move(factory)](auto revisions) {
+            constructing.set_value();
+            released.wait();
+            return factory(std::move(revisions));
+        }, [](std::exception_ptr) {}};
+    REQUIRE(owner.SubmitOrdered([&](auto&, std::stop_token) {
+        entered = true;
+        return detail::VisualRuntimeOwner::Notification{};
+    }));
+    constructing.get_future().wait();
+    auto stopped = std::async(std::launch::async, [&] { owner.RequestStop(); });
+    const auto status = stopped.wait_for(2s);
+    release.set_value();
+    CHECK(status == std::future_status::ready);
+    stopped.get();
+    owner.StopAndWait();
+    CHECK(owner.stopped());
+    CHECK_FALSE(entered.load());
+}
+
+TEST_CASE("safe incumbent retirement failure preserves the promoted runtime and permits later work") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
+    std::promise<void> first;
+    std::promise<void> failed;
+    std::promise<void> next;
+    std::atomic<std::uint64_t> promoted = 0U;
+    detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures),
+        [&](std::exception_ptr) { failed.set_value(); }};
+    REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
+        runtime.Publish(8U, 8U, [](auto, auto, auto) {});
+        return detail::VisualRuntimeOwner::Notification{[&] { first.set_value(); }};
+    }));
+    first.get_future().wait();
+    REQUIRE(owner.SubmitDiscrete([&](auto& runtime, std::stop_token) {
+        runtime.Publish(8U, 8U, [](auto, auto, auto) {});
+        promoted.store(runtime.Completed().revision(), std::memory_order_release);
+        backend->FailAfter(FakeImageBackend::FailurePoint::SynchronizeStream);
+        return detail::VisualRuntimeOwner::Notification{};
+    }, {}, true));
+    REQUIRE(failed.get_future().wait_for(2s) == std::future_status::ready);
+    auto retained = owner.Borrow();
+    REQUIRE(retained.valid());
+    CHECK(retained.plane(0U).revision() == promoted.load(std::memory_order_acquire));
+    retained = {};
+    REQUIRE(owner.SubmitOrdered([&](auto&, std::stop_token) {
+        return detail::VisualRuntimeOwner::Notification{[&] { next.set_value(); }};
+    }));
+    REQUIRE(next.get_future().wait_for(2s) == std::future_status::ready);
+    owner.StopAndWait();
+}
+
+TEST_CASE("active stop during staged construction rejects replacement before domain work") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
+    auto factory = test_live_runtime_factory(backend, captures);
+    std::promise<void> first;
+    std::promise<void> constructing;
+    std::promise<void> release;
+    std::promise<void> cancelled;
+    auto released = release.get_future().share();
+    std::atomic_bool entered = false;
+    std::size_t constructions = 0U;
+    detail::VisualRuntimeOwner owner{
+        [&, factory = std::move(factory)](auto revisions) {
+            if (++constructions == 2U) {
+                constructing.set_value();
+                released.wait();
+            }
+            return factory(std::move(revisions));
+        }, [](std::exception_ptr) {}};
+    REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
+        runtime.Publish(8U, 8U, [](auto, auto, auto) {});
+        return detail::VisualRuntimeOwner::Notification{[&] { first.set_value(); }};
+    }));
+    first.get_future().wait();
+    auto incumbent = owner.Borrow();
+    const auto revision = incumbent.plane(0U).revision();
+    incumbent = {};
+    REQUIRE(owner.SubmitDiscrete([&](auto&, std::stop_token) {
+        entered = true;
+        return detail::VisualRuntimeOwner::Notification{};
+    }, [&] { cancelled.set_value(); }, true));
+    constructing.get_future().wait();
+    owner.RequestActiveStop();
+    release.set_value();
+    REQUIRE(cancelled.get_future().wait_for(2s) == std::future_status::ready);
+    CHECK_FALSE(entered.load());
+    auto retained = owner.Borrow();
+    REQUIRE(retained.valid());
+    CHECK(retained.plane(0U).revision() == revision);
     retained = {};
     owner.StopAndWait();
 }
@@ -5098,6 +5329,8 @@ TEST_CASE("visual completion notification remains independent of a blocked produ
     std::promise<void> publish_entered;
     std::promise<void> release_publish;
     const auto release = release_publish.get_future().share();
+    std::promise<void> release_work;
+    const auto finish = release_work.get_future().share();
     std::promise<void> notified;
     std::promise<void> borrow_locked;
     detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {},
@@ -5113,6 +5346,7 @@ TEST_CASE("visual completion notification remains independent of a blocked produ
             publish_entered.set_value();
             release.wait();
         });
+        finish.wait();
         return detail::VisualRuntimeOwner::Notification{};
     }));
     publish_entered.get_future().wait();
@@ -5124,7 +5358,10 @@ TEST_CASE("visual completion notification remains independent of a blocked produ
     // Always release the product even when the assertion fails, so the evidence
     // reports a failed boundary instead of leaving a test-owned worker blocked.
     release_publish.set_value();
+    const auto borrow_status = borrow.wait_for(2s);
+    release_work.set_value();
     CHECK(notification_status == std::future_status::ready);
+    CHECK(borrow_status == std::future_status::ready);
     CHECK(notification.get());
     auto view = borrow.get();
     CHECK(view.valid());
@@ -5212,15 +5449,17 @@ TEST_CASE("visual terminal and failure boundaries discard pending continuations"
 
 class RetainedConstructionModel final : public mmltk::frameworks::gpu::SystemImageModel {
    public:
-    RetainedConstructionModel(std::shared_ptr<std::atomic_bool> destroyed, std::shared_ptr<std::atomic_uint64_t> release_calls)
+    RetainedConstructionModel(std::shared_ptr<std::atomic_bool> destroyed, std::shared_ptr<std::atomic_uint64_t> release_calls,
+                              std::exception_ptr failure = {}, bool all_released = false)
         : destroyed_(std::move(destroyed)),
           release_calls_(std::move(release_calls)),
-          failure_(std::make_exception_ptr(std::runtime_error("deterministic retained construction resource"))) {}
+          failure_(failure ? std::move(failure) : std::make_exception_ptr(std::runtime_error("deterministic retained construction resource"))),
+          all_released_(all_released) {}
     ~RetainedConstructionModel() override { destroyed_->store(true, std::memory_order_release); }
     [[nodiscard]] Release ReleaseResources() noexcept override {
         release_calls_->fetch_add(1U, std::memory_order_release);
         return {
-            .all_released = false,
+            .all_released = all_released_,
             .failure = failure_,
         };
     }
@@ -5229,35 +5468,80 @@ class RetainedConstructionModel final : public mmltk::frameworks::gpu::SystemIma
     std::shared_ptr<std::atomic_bool> destroyed_;
     std::shared_ptr<std::atomic_uint64_t> release_calls_;
     std::exception_ptr failure_;
+    bool all_released_;
 };
+
+TEST_CASE("visual runtime failures retain initiating execution and model retirement identities") {
+    using namespace mmltk::frameworks::gpu;
+    const bool safe = GENERATE(false, true);
+    const bool staged = GENERATE(false, true);
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto destroyed = std::make_shared<std::atomic_bool>(false);
+    auto releases = std::make_shared<std::atomic_uint64_t>(0U);
+    const auto initiating = std::make_exception_ptr(GdrTransportUnavailable("domain operation"));
+    const auto settlement = std::make_exception_ptr(std::runtime_error("stream settlement"));
+    const auto retirement = std::make_exception_ptr(std::runtime_error("model retirement"));
+    std::promise<std::exception_ptr> reported;
+    detail::VisualRuntimeOwner owner{
+        [&](auto revisions) {
+            return std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
+                .device = 0, .backend = backend,
+                .model = std::make_unique<RetainedConstructionModel>(destroyed, releases, retirement, safe),
+                .product_revisions = std::move(revisions)});
+        }, [&](std::exception_ptr failure) { reported.set_value(failure); }};
+    auto work = [&](auto&, std::stop_token) -> detail::VisualRuntimeOwner::Notification {
+        backend->FailAfter(FakeImageBackend::FailurePoint::SynchronizeStream, 0U, settlement);
+        std::rethrow_exception(initiating);
+    };
+    REQUIRE((staged ? owner.SubmitDiscrete(work, {}, true) : owner.SubmitOrdered(work)));
+    auto result = reported.get_future();
+    REQUIRE(result.wait_for(2s) == std::future_status::ready);
+    const auto failure = result.get();
+    CHECK(is_image_execution_failure(failure));
+    CHECK(find_image_failure<GdrTransportUnavailable>(failure) == initiating);
+    for (const auto& expected : {initiating, settlement, retirement})
+        CHECK(mmltk::frameworks::gpu::test_support::ContainsImageFailure(failure, expected));
+    CHECK_THROWS_WITH(std::rethrow_exception(failure), "domain operation");
+    CHECK(destroyed->load(std::memory_order_acquire) == safe);
+    if (!safe) CHECK_FALSE(owner.SubmitOrdered(no_op_visual_work));
+    owner.StopAndWait();
+}
 
 void check_visual_construction_custody(const FakeImageBackend::FailurePoint failure_point, const std::string_view expected_failure,
                                        const std::uint64_t expected_contexts, const std::uint64_t expected_release_calls) {
     auto backend = std::make_shared<FakeImageBackend>();
     auto destroyed = std::make_shared<std::atomic_bool>(false);
     auto release_calls = std::make_shared<std::atomic_uint64_t>(0U);
+    const auto construction_failure = std::make_exception_ptr(std::runtime_error("injected image backend failure"));
+    const auto release_failure = std::make_exception_ptr(std::runtime_error("deterministic retained construction resource"));
     std::atomic_uint64_t constructions = 0U;
     std::atomic_bool reported_typed_failure = false;
     std::promise<void> failed;
     {
         detail::VisualRuntimeOwner owner{
-            [&] {
+            [&](auto revisions) {
                 constructions.fetch_add(1U, std::memory_order_acq_rel);
                 return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
                     .device = 0,
                     .backend = backend,
-                    .model = std::make_unique<RetainedConstructionModel>(destroyed, release_calls),
+                    .model = std::make_unique<RetainedConstructionModel>(destroyed, release_calls, release_failure),
+                    .product_revisions = std::move(revisions),
                 });
             },
-            [&failed, &reported_typed_failure, expected_failure](const std::exception_ptr failure) {
+            [&, expected_failure](const std::exception_ptr failure) {
                 try {
                     std::rethrow_exception(failure);
                 } catch (const std::runtime_error& error) {
-                    reported_typed_failure.store(std::string_view{error.what()} == expected_failure, std::memory_order_release);
+                    const bool identities =
+                        mmltk::frameworks::gpu::test_support::ContainsImageFailure(failure, construction_failure) &&
+                        (expected_release_calls == 0U ||
+                         mmltk::frameworks::gpu::test_support::ContainsImageFailure(failure, release_failure));
+                    reported_typed_failure.store(std::string_view{error.what()} == expected_failure && identities,
+                                                std::memory_order_release);
                 } catch (...) {}
                 failed.set_value();
             }};
-        backend->FailAfter(failure_point);
+        backend->FailAfter(failure_point, 0U, construction_failure);
         REQUIRE(owner.SubmitOrdered(no_op_visual_work));
         REQUIRE(failed.get_future().wait_for(2s) == std::future_status::ready);
         CHECK_FALSE(owner.SubmitOrdered(no_op_visual_work));
@@ -5276,7 +5560,7 @@ void check_visual_construction_custody(const FakeImageBackend::FailurePoint fail
 }
 
 TEST_CASE("visual runtime owner retains unsafe factory construction and blocks reconstruction") {
-    check_visual_construction_custody(FakeImageBackend::FailurePoint::CreateStream, "deterministic retained construction resource", 1U, 1U);
+    check_visual_construction_custody(FakeImageBackend::FailurePoint::CreateStream, "injected image backend failure", 1U, 1U);
 }
 
 TEST_CASE("visual runtime retirement preserves the model and context while release remains incomplete") {
@@ -5306,10 +5590,11 @@ TEST_CASE("visual retirement reports an unestablished context boundary and disab
     auto backend = std::make_shared<FakeImageBackend>();
     std::atomic_uint64_t constructions = 0U;
     std::promise<void> failed;
-    detail::VisualRuntimeOwner owner{[&] {
+    detail::VisualRuntimeOwner owner{[&](auto revisions) {
                                          constructions.fetch_add(1U, std::memory_order_acq_rel);
                                          return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(
-                                             mmltk::frameworks::gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend});
+                                             mmltk::frameworks::gpu::SystemImageRuntimeConfig{
+                                                 .device = 0, .backend = backend, .product_revisions = std::move(revisions)});
                                      },
                                      [&failed](std::exception_ptr) { failed.set_value(); }};
     REQUIRE(owner.SubmitOrdered(
@@ -5500,10 +5785,11 @@ TEST_CASE("recoverable visual failure restores creator policy before rebuilding 
     std::promise<void> failed;
     std::promise<std::vector<int>> completed;
     detail::VisualRuntimeOwner owner{
-        [&] {
+        [&](auto revisions) {
             construction_affinities.push_back(allowed_cpu_set());
             return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(
-                mmltk::frameworks::gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend, .execution = execution});
+                mmltk::frameworks::gpu::SystemImageRuntimeConfig{
+                    .device = 0, .backend = backend, .execution = execution, .product_revisions = std::move(revisions)});
         },
         [&](std::exception_ptr) { failed.set_value(); }};
     REQUIRE(owner.SubmitOrdered([](auto&, std::stop_token) -> detail::VisualRuntimeOwner::Notification {

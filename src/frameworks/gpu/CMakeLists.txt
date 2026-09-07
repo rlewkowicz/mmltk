@@ -13,10 +13,14 @@ mmltk_register_public_headers(mmltk_frameworks_gpu
         gdr_mapped_buffer.h
         image_geometry.h
         image_buffer.h
+        image_failure.h
+        image_product_pool.h
         image_types.h
         exported_image_buffer.h
         external_graphics_timeline.h
         system_image_worker.h
+        system_image_runtime.h
+        product_revision_sequence.h
         system_image_model.h
         cuda_high_water_allocation.h
         cuda_pitched_buffer_view.h
@@ -38,6 +42,8 @@ mmltk_register_ordinary_sources(
     exported_image_buffer.cpp
     external_graphics_timeline.cpp
     image_buffer.cpp
+    image_product_pool.cpp
+    system_image_runtime.cpp
     system_image_worker.cpp)
 mmltk_register_private_headers(
     mmltk_frameworks_gpu

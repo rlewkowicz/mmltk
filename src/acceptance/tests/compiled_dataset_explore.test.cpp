@@ -1,5 +1,5 @@
 #include "src/backend/data/compiled_dataset.h"
-#include "src/frameworks/gpu/system_image_worker.h"
+#include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/backend/data/dataset_loader.h"
 #include <algorithm>
 #include <array>

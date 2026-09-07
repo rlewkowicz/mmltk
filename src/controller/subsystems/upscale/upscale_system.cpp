@@ -1,6 +1,6 @@
 #include "src/controller/subsystems/upscale/upscale_system.h"
 #include "src/controller/presentation/detail/visual_runtime_owner.h"
-#include "src/frameworks/gpu/system_image_worker.h"
+#include "src/frameworks/gpu/system_image_runtime.h"
 
 #include <cuda.h>
 
@@ -287,7 +287,7 @@ class UpscaleSystem::Impl final {
                         if (demand != demand_ || stop.stop_requested()) return {};
                         // Obsolete work may have replaced the private output without
                         // committing its document/frame. Only reselect a committed pair.
-                        if (state_.input == request.source && state_.frame.revision == runtime.output().revision()) {
+                        if (state_.input == request.source && state_.frame.revision == runtime.OutputFacts().revision) {
                             state_.busy = false;
                             state_.ready = true;
                             AdvanceRevision();
@@ -346,8 +346,11 @@ class UpscaleSystem::Impl final {
                         processed_ && processed_->kernel == request.kernel && processed_->source.source == request.source.source &&
                         processed_->source.extent == request.source.extent && processed_->source.content == request.source.content &&
                         clean_identity(processed_->source) == clean_identity(request.source);
+                    auto output_candidate = runtime.AcquireOutput(stop, reuse_clean ? runtime.Completed() :
+                        mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput{});
+                    if (!output_candidate.valid()) return {};
                     runtime.Publish(
-                        target.width, target.height,
+                        output_candidate, target.width, target.height,
                         [this, model, &input, request, reuse_clean, demand](const auto output, const auto semantic, const auto stream) {
                             if (diagnostics_.valid())
                                 diagnostics_(
@@ -361,8 +364,9 @@ class UpscaleSystem::Impl final {
                             if (!reuse_clean) model->Run(request.kernel, input.plane(0U).plane(), output, stream);
                             model->Semantics(input.plane(1U).plane(), semantic, stream);
                         });
+                    static_cast<void>(runtime.CommitOutput(std::move(output_candidate)));
                     processed_ = request;
-                    if (!reuse_clean) processed_clean_revision_ = runtime.output().revision();
+                    if (!reuse_clean) processed_clean_revision_ = runtime.OutputFacts().revision;
                     {
                         std::scoped_lock lock(mutex_);
                         if (demand != demand_) return {};
@@ -379,7 +383,7 @@ class UpscaleSystem::Impl final {
                                     .instance = 1U,
                                 },
                             .extent = target,
-                            .revision = runtime.output().revision(),
+                            .revision = runtime.OutputFacts().revision,
                             .content = {request.source.content.x * kUpscaleOutputScale, request.source.content.y * kUpscaleOutputScale,
                                         request.source.content.width * kUpscaleOutputScale,
                                         request.source.content.height * kUpscaleOutputScale},
@@ -391,7 +395,7 @@ class UpscaleSystem::Impl final {
                         .system = VisualSystemKind::Upscale,
                         .operation = VisualDiagnosticOperation::UpscaleModelSubmitted,
                         .device = settings_.device,
-                        .generation = runtime.output().revision(),
+                        .generation = runtime.OutputFacts().revision,
                         .value = static_cast<std::uint64_t>(request.kernel),
                         .detail = demand,
                     });
@@ -499,7 +503,7 @@ VisualDocumentRead UpscaleSystem::BorrowDocument(const VisualFrame& frame) const
 
 VisualRuntimeFactory make_native_upscale_runtime_factory(const VisualDeviceSettings settings) {
     if (!settings.valid()) throw contracts::InvalidIntentError("Upscale device settings are invalid");
-    return [settings, execution = resolve_visual_device_execution(settings)] {
+    return [settings, execution = resolve_visual_device_execution(settings)](auto revisions) {
         return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
             .device = settings.device,
             .model = std::make_unique<NativeUpscaleModel>(settings.device),
@@ -508,6 +512,7 @@ VisualRuntimeFactory make_native_upscale_runtime_factory(const VisualDeviceSetti
             .output_layout = mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
             .numa_node = settings.numa_node,
             .execution = execution,
+            .product_revisions = std::move(revisions),
         });
     };
 }

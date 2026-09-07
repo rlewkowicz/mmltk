@@ -69,12 +69,12 @@ std::unique_ptr<ExploreSystem> make_shell_explore_system(SettingsSystem& setting
     const auto nproc = normalize_explore_parallelism(configuration.explore_nproc, execution.placement);
     return std::make_unique<ExploreSystem>(
         settings, configuration.base_visual, nproc,
-        [&settings, visual = configuration.base_visual, native = configuration.explore, nproc]() mutable {
+        [&settings, visual = configuration.base_visual, native = configuration.explore, nproc](auto revisions) mutable {
             const auto selected = settings.explore_settings_candidate();
             visual.device = selected.device_id;
             visual.numa_node = selected.loading.numa_node;
             native.loading = selected.loading;
-            return make_native_explore_runtime_factory(visual, nproc, native)();
+            return make_native_explore_runtime_factory(visual, nproc, native)(std::move(revisions));
         },
         std::move(events), diagnostics);
 }

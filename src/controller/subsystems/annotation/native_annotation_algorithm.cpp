@@ -1,5 +1,5 @@
 #include "src/controller/subsystems/annotation/annotation_system.h"
-#include "src/frameworks/gpu/system_image_worker.h"
+#include "src/frameworks/gpu/system_image_runtime.h"
 
 #include <cuda_runtime_api.h>
 
@@ -317,7 +317,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
 
 VisualRuntimeFactory make_native_annotation_runtime_factory(const VisualDeviceSettings settings) {
     if (!settings.valid()) throw contracts::InvalidIntentError("Annotation native configuration is invalid");
-    return [settings, execution = resolve_visual_device_execution(settings)] {
+    return [settings, execution = resolve_visual_device_execution(settings)](auto revisions) {
         return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
             .device = settings.device,
             .model = std::make_unique<NativeAnnotationAlgorithm>(),
@@ -325,6 +325,7 @@ VisualRuntimeFactory make_native_annotation_runtime_factory(const VisualDeviceSe
             .output_layout = mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
             .numa_node = settings.numa_node,
             .execution = execution,
+            .product_revisions = std::move(revisions),
         });
     };
 }

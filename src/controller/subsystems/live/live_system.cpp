@@ -1,6 +1,6 @@
 #include "src/controller/subsystems/live/live_system.h"
 #include "src/controller/presentation/detail/visual_runtime_owner.h"
-#include "src/frameworks/gpu/system_image_worker.h"
+#include "src/frameworks/gpu/system_image_runtime.h"
 
 #include <condition_variable>
 #include <limits>
@@ -73,7 +73,7 @@ class LiveSystem::Impl final {
                                         .instance = 1U,
                                     },
                                 .extent = request.extent,
-                                .revision = runtime.output().revision(),
+                                .revision = runtime.OutputFacts().revision,
                             };
                         }
                         PublishFrame();
@@ -81,7 +81,7 @@ class LiveSystem::Impl final {
                             .system = VisualSystemKind::Live,
                             .operation = VisualDiagnosticOperation::FrameCompleted,
                             .device = settings_.device,
-                            .generation = runtime.output().revision(),
+                            .generation = runtime.OutputFacts().revision,
                         });
                         cadence_ready.wait_for(cadence_lock, worker_stop, cadence, [] { return false; });
                     }

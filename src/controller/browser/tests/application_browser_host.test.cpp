@@ -1,5 +1,5 @@
 #include "src/controller/browser/application_browser_host.h"
-#include "src/frameworks/gpu/system_image_worker.h"
+#include "src/frameworks/gpu/system_image_runtime.h"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -273,13 +273,14 @@ class ReadyHostAnnotation final {
               mmltk::frameworks::gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend_})),
           annotation_(
               {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-              [backend = backend_, closed = closed_] {
+              [backend = backend_, closed = closed_](auto revisions) {
                   return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
                       .device = 0,
                       .backend = backend,
                       .model = std::make_unique<HostAnnotationAlgorithm>(closed),
                       .input_layout = mmltk::frameworks::gpu::ImageProductLayout::Clean,
                       .output_layout = mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                      .product_revisions = std::move(revisions),
                   });
               },
               [this](const VisualFrame& frame) {
@@ -298,7 +299,7 @@ class ReadyHostAnnotation final {
                   changed_.notify_all();
               }) {
         source_->Publish(16U, 16U, [](auto, auto, auto) {});
-        static_cast<void>(annotation_.Open({.source = visual_frame(identity_, {16U, 16U}, source_->output().revision())}));
+        static_cast<void>(annotation_.Open({.source = visual_frame(identity_, {16U, 16U}, source_->OutputFacts().revision)}));
         const bool ready = Wait([this] { return annotation_.snapshot().ready || !failure_.empty(); });
         INFO("Annotation startup failure: " << failure_);
         REQUIRE(ready);

@@ -1,6 +1,6 @@
 #include "src/controller/subsystems/annotation/annotation_system.h"
 #include "src/controller/presentation/detail/visual_runtime_owner.h"
-#include "src/frameworks/gpu/system_image_worker.h"
+#include "src/frameworks/gpu/system_image_runtime.h"
 
 #include <mutex>
 #include <optional>
@@ -303,7 +303,7 @@ class AnnotationSystem::Impl final {
     }
 
     [[nodiscard]] VisualFrame Frame(const mmltk::frameworks::gpu::SystemImageRuntime& runtime, const VisualExtent extent) const {
-        return visual_frame({PresentationSourceKind::Annotation, 1U}, extent, runtime.output().revision());
+        return visual_frame({PresentationSourceKind::Annotation, 1U}, extent, runtime.OutputFacts().revision);
     }
     void RequireIdle() const {
         if (state_.busy) throw contracts::BusyError("Annotation is busy");
